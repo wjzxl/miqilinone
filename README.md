@@ -112,6 +112,17 @@ python3 run.py p6-live-git --backend deepseek --allow-same-family
 干净 worktree** 上 `git apply` 作者的 diff，再驱动真实 CLI 判定。模型不知道答案 ——
 它得自己从「意图 + 一手原文」把 6% 推成 `TAX_RATE = 0.06`。
 
+**多文件编辑**（模型自己决定改哪些文件）：
+
+```bash
+python3 run.py p7-live-multi --backend deepseek --allow-same-family
+```
+
+这次模型有 `READ` 工具：先读文件、再决定改什么。改动范围由总厨划定
+（`--scope`，默认 `shop/**`），**越界即拒**——不是提醒，是拒绝写入。
+任务本身需要**两个文件**都改对才通过：两条 Drive 断言各管一个文件，
+每条断言都有对应的变异体证明它会开火。
+
 **关于模型家族独立性**：`deepseek-flash` 与 `deepseek-v4-pro` 同属
 `open-source-cn` 家族，默认会被 holdout 护栏拒绝。放行要显式声明
 （`--allow-same-family` 或 `MW_ALLOW_SAME_MODEL_FAMILY=1`），而且这份豁免
@@ -228,7 +239,9 @@ base_line clean=True  →  逐条注入变异  →  4/4 条规则命中
 - MCP 网关尚未接入；模型侧目前只做了 DeepSeek 与通用 OpenAI 兼容端点。
 - 真实模型接在 P0（只读分析）与 P2（改代码）两条链路；P3 的仓库访谈与自动起草
   仍是确定性实现。
-- P2 的可写范围目前只有一个文件；多文件、多轮编辑、模型自己决定改哪些文件尚未做。
+- 多文件编辑目前只在 P7 这条固定任务上验证过（两个文件）；模型在**陌生仓库**
+  里自己定位该改哪些文件的能力还没被测过。
+- P2 的单文件路径可写范围仍是一个文件；两条路径的 worker 协议不同。
 
 ## 11. 许可
 

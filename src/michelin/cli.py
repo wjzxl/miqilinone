@@ -470,6 +470,153 @@ def cmd_p4_draft(args: argparse.Namespace) -> int:
     return 0 if not problems else 1
 
 
+def cmd_p7_live_multi(args: argparse.Namespace) -> int:
+    """P7：**多文件编辑** —— 模型自己决定改哪些文件，但改不了不该改的。
+
+    与 `p6-live-git` 的差别：那里总厨点名了一个文件、模型给一行赋值；这里
+    模型有 READ 工具，能先读再决定，改动范围由总厨划定（glob 硬约束），
+    任务本身需要**两个文件**都被改对才通过（两条 Drive 断言各管一个文件）。
+    """
+    import time
+
+    from .chief.p2_workflow import P2Pipeline, P2Scenario
+    from .models import MeteredModel
+    from .runtime import Budget, BudgetExceeded, BudgetGuard, Charge
+    from .verification.skill_spec import build_multi_file_spec
+    from .workers.editing_worker import MultiFileCodeWorker
+    from .workspace.seed import CLI_SOURCE_MULTI, PRICING_CORRECT
+
+    pair = build_models(
+        backend=args.backend,
+        allow_same_family=True if args.allow_same_family else None,
+    )
+    worker_model, verifier_model = pair.worker, pair.verifier
+    if pair.waiver is None and worker_model.family == verifier_model.family:
+        print("错误: worker 与 verifier 同家族但没有豁免", file=sys.stderr)
+        return 3
+
+    work = Path(args.workdir)
+    work.mkdir(parents=True, exist_ok=True)
+    guard = BudgetGuard(
+        Budget(
+            max_actions=int(args.max_actions),
+            max_seconds=float(args.max_seconds),
+            max_external_requests=int(args.max_requests),
+            max_cost_usd=float(args.max_cost),
+        ),
+        work / f"budget-{int(time.time())}.jsonl",
+        run_id=f"p7-{int(time.time())}",
+    )
+
+    def charge(usage) -> None:
+        guard.check("llm-call", Charge(
+            actions=1, external_requests=usage.external_requests,
+            input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
+        ))
+
+    worker_metered = MeteredModel(worker_model, charge)
+    verifier_metered = MeteredModel(verifier_model, charge)
+
+    store = _store(args.db, args.store, args.dsn)
+    scope = tuple(args.scope.split(",")) if args.scope else ("shop/**",)
+    pipeline = P2Pipeline(
+        store, SourcePlane(store), worker_metered, verifier_metered,
+        work / "runs", max_rework=args.max_rework, waiver=pair.waiver,
+        skill_spec=build_multi_file_spec(),
+        golden_files={
+            "shop/pricing.py": PRICING_CORRECT,
+            "shop/cli.py": CLI_SOURCE_MULTI,
+        },
+        writable_paths=scope,
+        worker_factory=lambda model, ws: MultiFileCodeWorker(
+            model, ws, max_rounds=args.max_rounds),
+    )
+    scenario = P2Scenario(
+        worker_rates=("0.06",),
+        sampling_outcome=args.sampling_outcome,
+        sampling_root_cause=args.sampling_root_cause,
+    )
+    intent = TaskIntent(
+        intent=args.intent,
+        source_bodies=(
+            "【需求原文 1】税率应为 6%（改 shop/pricing.py），金额保留两位小数。",
+            "【需求原文 2】doctor 必须报出当前税率，形如 rate=0.06（改 shop/cli.py）。",
+            "【治理原文】验收必须驱动真实 CLI；每条门禁都要有故意破坏的变体证明它会开火。",
+        ),
+        source_system="live-model-multi",
+    )
+
+    started = time.monotonic()
+    try:
+        result = pipeline.handle(intent, scenario)
+    except BudgetExceeded as exc:
+        print(f"预算熔断      : {exc.reason}", file=sys.stderr)
+        return 4
+    elapsed = time.monotonic() - started
+
+    view = replay(store, result.run_id)
+    ledger = guard.replay()
+    worker_usage = worker_metered.total_usage
+    verifier_usage = verifier_metered.total_usage
+    total_in = worker_usage.input_tokens + verifier_usage.input_tokens
+    total_out = worker_usage.output_tokens + verifier_usage.output_tokens
+
+    print("=== 真实模型 · 多文件编辑 ===")
+    print(f"worker 模型    : {worker_model.version}（家族 {worker_model.family}）")
+    print(f"verifier 模型  : {verifier_model.version}（家族 {verifier_model.family}）")
+    if pair.waiver:
+        print(f"独立性豁免     : ⚠️ 已降级并入链 —— {pair.waiver.reason}")
+    else:
+        print("独立性         : worker 与 verifier 分属不同家族 ✅")
+    print(f"可写范围       : {', '.join(scope)}（越界即拒，不是提醒）")
+    print(f"run_id         : {result.run_id}")
+    print(f"最终状态       : {result.state.value}")
+    print(f"裁决           : {result.verdict or '无（阻断/升级人工）'}")
+    print(f"执行次数       : {result.attempts}（返工上限 {args.max_rework}）")
+    print(f"skill 状态     : {result.skill_status}")
+    print(f"变异门禁全开火 : {result.mutants_all_fired}")
+    print(f"head_sha       : {(result.head_sha or '')[:24] or '-'}")
+    print(f"耗时           : {elapsed:.1f}s")
+    print()
+    print("=== 模型实际做了什么 ===")
+    for event in view.timeline:
+        if event.get("type") == "worker.model_response":
+            payload = event.get("payload", {})
+            tool_calls = payload.get("tool_calls", [])
+            for call in tool_calls:
+                if call.get("tool") == "read_file":
+                    print(f"  读了      : {call.get('paths')}")
+                elif call.get("tool") == "write_file":
+                    print(f"  改了      : {call.get('paths')}")
+            print(f"  token 用量: {payload.get('usage')}")
+        if event.get("type") == "worker.output_rejected":
+            payload = event.get("payload", {})
+            print(f"  ⚠️ 被拒    : {payload.get('path', '')} {payload.get('reason', '')}")
+    print()
+    print("=== 模型写出的 diff ===")
+    for event in view.timeline:
+        if event.get("type") == "artifact.produced":
+            print(str(event.get("payload", {}).get("patch", "")).rstrip())
+    print()
+    print("=== 真实用量 ===")
+    print(f"worker         : in={worker_usage.input_tokens} out={worker_usage.output_tokens} "
+          f"reasoning={worker_usage.reasoning_tokens} 轮次上限 {args.max_rounds}")
+    print(f"verifier       : in={verifier_usage.input_tokens} out={verifier_usage.output_tokens} "
+          f"reasoning={verifier_usage.reasoning_tokens}")
+    print(f"合计           : in={total_in} out={total_out} "
+          f"≈${guard.budget.cost(total_in, total_out):.6f}")
+    print(f"预算账本       : external_requests={ledger['usage']['external_requests']} "
+          f"cost=${ledger['usage']['cost_usd']:.6f} kill_switch={guard.kill_switch_engaged}")
+    print()
+    print(f"事件数         : {len(view.timeline)} | 哈希链 "
+          f"{'完好' if view.chain_ok else '损坏'} | 六锚点 "
+          f"{'齐全' if view.complete else '缺失'}")
+    print(f"生成物目录     : {result.workdir}")
+    print(f"回放命令       : python3 run.py replay --run-id {result.run_id}")
+    return 0 if (view.complete and view.chain_ok
+                 and result.state.value == "ACCEPTED") else 1
+
+
 def cmd_p6_live_git(args: argparse.Namespace) -> int:
     """P6-git：**真实模型**在真实 git worktree 里改代码，由独立 verifier 重放裁决。
 
@@ -906,6 +1053,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_p6g.add_argument("--sampling-outcome", default="ACCEPT", choices=["ACCEPT", "REJECT"])
     p_p6g.add_argument("--sampling-root-cause", default="")
     p_p6g.set_defaults(func=cmd_p6_live_git)
+
+    p_p7 = sub.add_parser(
+        "p7-live-multi", help="P7：真实模型多文件编辑（自己决定改哪些文件，越界即拒）")
+    p_p7.add_argument("--backend", default=os.getenv("MW_MODEL_BACKEND", "deepseek"))
+    p_p7.add_argument("--intent", default=(
+        "修复 shop 结算：税率改成 6%（shop/pricing.py），"
+        "并且 doctor 命令要报出当前税率（shop/cli.py）"))
+    p_p7.add_argument("--scope", default="shop/**",
+                      help="可写范围（逗号分隔的 glob）；越界即拒")
+    p_p7.add_argument("--workdir", default=str(PROJECT_ROOT / "data" / "p7-runs"))
+    p_p7.add_argument("--max-rounds", type=int, default=6,
+                      help="工具循环轮数上限（每轮一次真实模型调用）")
+    p_p7.add_argument("--max-rework", type=int, default=1)
+    p_p7.add_argument("--max-actions", type=int, default=30)
+    p_p7.add_argument("--max-seconds", type=float, default=900.0)
+    p_p7.add_argument("--max-requests", type=int, default=30)
+    p_p7.add_argument("--max-cost", type=float, default=2.0)
+    p_p7.add_argument("--allow-same-family", action="store_true",
+                      help="显式接受 worker/verifier 同属一个模型家族（豁免会写进证据链）")
+    p_p7.add_argument("--sampling-outcome", default="ACCEPT", choices=["ACCEPT", "REJECT"])
+    p_p7.add_argument("--sampling-root-cause", default="")
+    p_p7.set_defaults(func=cmd_p7_live_multi)
     return parser
 
 

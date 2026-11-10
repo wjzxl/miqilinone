@@ -24,9 +24,9 @@ from ..workspace.seed import CLI_SOURCE, PRICING_CORRECT, GitWorkspace
 from ..verification.behavior import BehaviorVerifier
 from ..verification.generator import generate_skill
 from ..verification.holdout import build_holdout
-from ..verification.mutants import MutationReport, run_mutation_suite
+from ..verification.mutants import MUTATIONS, MutationReport, run_mutation_suite
 from ..verification.runner import prove_skill
-from ..verification.skill_spec import SkillProof
+from ..verification.skill_spec import SkillProof, SkillSpec
 from ..chief.policy import (
     EvidenceSpec, Kickoff, Predicate, TaskIntent, TaskState, assert_transition,
 )
@@ -76,6 +76,11 @@ class P2Pipeline:
         *,
         max_rework: int = 2,
         waiver: IndependenceWaiver | None = None,
+        skill_spec: SkillSpec | None = None,
+        golden_files: dict[str, str] | None = None,
+        writable_paths: tuple[str, ...] = ("shop/pricing.py",),
+        worker_factory=None,
+        mutations=None,
     ):
         if worker_model.family == verifier_model.family and waiver is None:
             raise RuntimeError(
@@ -89,6 +94,12 @@ class P2Pipeline:
         self.workdir = Path(workdir)
         self.max_rework = max_rework
         self.waiver = waiver
+        # 以下四项让同一条流水线也能跑「多文件」任务；默认值 = 原来的 P2 行为。
+        self.skill_spec = skill_spec
+        self.golden_files = golden_files
+        self.writable_paths = tuple(writable_paths)
+        self.worker_factory = worker_factory
+        self.mutations = tuple(mutations) if mutations else MUTATIONS
 
     def _emit(self, run_id: str, task_id: str, event_type: str, payload: dict,
               **fields: object) -> int:
@@ -117,7 +128,17 @@ class P2Pipeline:
             Predicate("mutation_gate_active", "governance_contains", "变异"),
         ))
 
-    def _run_worker(self, worker: GitCodeWorker, kickoff: Kickoff, docs,
+    def _make_worker(self, workspace: GitWorkspace):
+        """每次 attempt 都开一个**全新** worker（全新 worktree + 全新上下文）。
+
+        worker_factory 让「多文件编辑 worker」能复用同一条流水线；
+        默认仍是 P2 的单文件 worker，既有行为一字不变。
+        """
+        if self.worker_factory is not None:
+            return self.worker_factory(self.worker_model, workspace)
+        return GitCodeWorker(self.worker_model, workspace)
+
+    def _run_worker(self, worker, kickoff: Kickoff, docs,
                     run_id: str, task_id: str):
         """跑一次 worker；产出不可机械检查时返回 None（记事件，不崩流水线）。"""
         try:
@@ -183,7 +204,7 @@ class P2Pipeline:
             "evidence_spec": spec.to_dict(),
             "spec_kind": "behavior",
             "enforced_by": "six_phase_skill + code_mutation_suite",
-            "writable_paths": ["shop/pricing.py"],
+            "writable_paths": list(self.writable_paths),
             "unit": "一个可验证单元：修对税率并驱动真实 CLI",
         })
         self.store.put_task({
@@ -195,7 +216,8 @@ class P2Pipeline:
 
         # ---- 生成 skill（此刻还是 DRAFT） ----
         skill = generate_skill(
-            root / "skills", weaken_drive=scenario.weaken_drive,
+            root / "skills", spec=self.skill_spec,
+            weaken_drive=scenario.weaken_drive,
             cleanup_eats_evidence=scenario.cleanup_eats_evidence,
         )
         self._emit(run_id, task_id, "skill.generated", {
@@ -210,8 +232,12 @@ class P2Pipeline:
 
         # ---- §4 端到端证明（在 golden stand-in 上；stand-in 步骤必须如实列出） ----
         golden = workspace.worktree("golden")
-        golden.write_file("shop/pricing.py", PRICING_CORRECT)
-        golden.write_file("shop/cli.py", CLI_SOURCE)
+        golden_files = self.golden_files or {
+            "shop/pricing.py": PRICING_CORRECT,
+            "shop/cli.py": CLI_SOURCE,
+        }
+        for rel, content in golden_files.items():
+            golden.write_file(rel, content)
         stand_in = (
             "golden worktree 写入 PRICING_CORRECT 作为已知正确基线（目标应用本身仍需作者修复）",
             "未使用远程/生产环境，全部在本机临时 git worktree 内",
@@ -224,7 +250,12 @@ class P2Pipeline:
         })
 
         # ---- 代码级变异测试 ----
-        mutations: MutationReport = run_mutation_suite(skill, workspace, root / "mutants")
+        # 干净基线必须与 skill 的期望一致：多文件场景的基线是「两个文件都改对」。
+        mutations: MutationReport = run_mutation_suite(
+            skill, workspace, root / "mutants",
+            baseline_files=golden_files,
+            mutations=self.mutations,
+        )
         self._emit(run_id, task_id, "skill.mutants_tested", {
             **mutations.to_dict(),
             "note": "每个坏版本都必须让 Drive 断言开火，否则门禁形同虚设",
@@ -250,12 +281,12 @@ class P2Pipeline:
             )
 
         # ---- 派发 → 真实 diff → 独立行为裁决 ----
-        worker = GitCodeWorker(self.worker_model, workspace)
+        worker = self._make_worker(workspace)
         verifier = BehaviorVerifier(self.store, self.verifier_model, skill, workspace, root)
         kickoff_base = {
             "task_id": task_id, "intent": intent.intent,
             "source_hashes": source_hashes,
-            "writable_paths": ("shop/pricing.py",),
+            "writable_paths": self.writable_paths,
             "forbidden_actions": ("network_egress", "git_push", "shell_exec"),
             "evidence_spec": spec, "risk_level": intent.risk_level, "budget": intent.budget,
         }
@@ -268,8 +299,12 @@ class P2Pipeline:
             attempts = attempt
             # Scene 用第 attempt 个速率脚本控制 worker 这次「修成什么」。
             rate = scenario.worker_rates[min(attempt - 1, len(scenario.worker_rates) - 1)]
-            self.worker_model = _with_rate(self.worker_model, rate)
-            worker = GitCodeWorker(self.worker_model, workspace)
+            if self.worker_factory is None:
+                # 只给「单文件 + 脚本模型」这条路径注入目标值。
+                # 多文件 worker 必须自己推导（注入答案会让验证失去意义），
+                # 而且 _with_rate 会覆盖脚本内容，会把多文件协议冲掉。
+                self.worker_model = _with_rate(self.worker_model, rate)
+            worker = self._make_worker(workspace)
 
             kickoff = Kickoff(**kickoff_base, attempt=attempt)
             worker_run_id = new_id("run")
@@ -307,7 +342,8 @@ class P2Pipeline:
                 "model_version": output.model_response.model_version,
                 "prompt_hash": output.model_response.prompt_hash,
                 "semconv_version": SEMCONV_VERSION,
-                "tool_policy": {"writable_paths": ["shop/pricing.py"], "git_diff": True},
+                "tool_policy": {"writable_paths": list(self.writable_paths),
+                                "git_diff": True},
                 "started_at": utcnow(),
             })
             self._emit(run_id, task_id, "worker.model_response", {

@@ -89,6 +89,54 @@ if __name__ == "__main__":
     raise SystemExit(main())
 '''
 
+CLI_SOURCE_MULTI = '''"""shop 的真实用户入口（多文件任务版本）：python3 -m shop.cli total 10 20。
+
+与 CLI_SOURCE 的差别只有一个：doctor 会报出当前税率。
+多文件任务要改两个文件（pricing.py 的税率 + cli.py 的 doctor 输出），
+所以 golden 版本必须同时具备这两个正确状态，否则变异门禁的基线就不对。
+"""
+import json
+import os
+import sys
+from pathlib import Path
+
+from .pricing import total_price, format_amount, TAX_RATE
+
+VERSION = "shop-1.0"
+
+
+def main(argv=None):
+    argv = list(argv if argv is not None else sys.argv[1:])
+    if not argv:
+        print("usage: total <amount>... | doctor", file=sys.stderr)
+        return 2
+    cmd = argv[0]
+    if cmd == "doctor":
+        print(f"SHOP_READY version={VERSION} rate={TAX_RATE:.2f}")
+        return 0
+    if cmd == "total":
+        items = [float(x) for x in argv[1:]]
+        if not items:
+            print("TOTAL=0.00")
+            return 0
+        line = f"TOTAL={format_amount(total_price(items))}"
+        print(line)
+        data_dir = Path(os.environ.get("SHOP_DATA_DIR", "./data"))
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "receipt.json").write_text(
+            json.dumps({"items": items, "total": line}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return 0
+    print(f"unknown command: {cmd}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
 INIT_SOURCE = '"""shop: 一个用于验证循环的真实小应用。"""\n'
 
 README = """# shop
@@ -119,6 +167,14 @@ class Worktree:
 
     def diff(self, pathspec: str = "shop/pricing.py") -> str:
         return _git("-C", str(self.path), "diff", "--no-color", "--", pathspec).stdout
+
+    def diff_all(self) -> str:
+        """整个 worktree 相对 HEAD 的 diff（多文件编辑用）。
+
+        仍然用真 git 生成：模型给的是「文件 → 新内容」，写盘与 diff 都是
+        确定性的，验证的是产物而不是作者对产物的描述。
+        """
+        return _git("-C", str(self.path), "diff", "--no-color").stdout
 
     def head_sha(self) -> str:
         return _git("-C", str(self.path), "rev-parse", "HEAD").stdout.strip()

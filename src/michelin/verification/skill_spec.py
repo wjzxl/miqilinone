@@ -36,6 +36,22 @@ PROBE_ARGS: tuple[str, ...] = ("total", "10", "20")
 
 
 @dataclass(frozen=True, slots=True)
+class DriveCheck:
+    """一条额外的 Drive 断言：跑一个真实用户命令，期望 stdout 含某个子串。
+
+    为什么需要它：任务要改**多个**文件时，每条断言负责一个文件。
+    只有一条断言时，模型只改一个文件也能通过 —— 多文件这件事根本没被验证。
+    """
+
+    command: tuple[str, ...]
+    expect: str
+    label: str
+
+    def to_dict(self) -> dict:
+        return {"command": list(self.command), "expect": self.expect, "label": self.label}
+
+
+@dataclass(frozen=True, slots=True)
 class SkillSpec:
     """一次「访谈仓库」的结果：surface / run / drive / observe / isolate。"""
 
@@ -47,9 +63,14 @@ class SkillSpec:
     evidence_path: str
     isolate_note: str
     features: tuple[str, ...]
+    extra_drive_checks: tuple[DriveCheck, ...] = ()
 
     def to_dict(self) -> dict:
-        return {**asdict(self), "features": list(self.features)}
+        return {
+            **asdict(self),
+            "features": list(self.features),
+            "extra_drive_checks": [c.to_dict() for c in self.extra_drive_checks],
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,4 +126,30 @@ def build_shop_spec() -> SkillSpec:
         evidence_path="evidence/proof.json （run 目录内，cleanup 后必须存活）",
         isolate_note="SHOP_DATA_DIR 按 run 隔离，两个实例可并行；绝不复用共享 data 目录",
         features=("total", "doctor", "receipt-side-effect"),
+    )
+
+
+def build_multi_file_spec() -> SkillSpec:
+    """多文件任务的 spec：除了 total 金额，还要 doctor 报出当前税率。
+
+    第二条断言对应**另一个文件**（shop/cli.py）：只有它才能证明「模型确实
+    改了 cli.py」—— 一条断言时模型只改 pricing.py 也能过，多文件就形同虚设。
+    """
+    base = build_shop_spec()
+    return SkillSpec(
+        app_name=base.app_name,
+        surface=base.surface,
+        run_command=base.run_command,
+        drive_command=base.drive_command,
+        expected_output=base.expected_output,
+        evidence_path=base.evidence_path,
+        isolate_note=base.isolate_note,
+        features=base.features,
+        extra_drive_checks=(
+            DriveCheck(
+                command=("doctor",),
+                expect="rate=0.06",
+                label="doctor 必须报出当前税率（对应 shop/cli.py 的改动）",
+            ),
+        ),
     )

@@ -49,6 +49,16 @@ MUTATIONS: tuple[tuple[str, str, str, str], ...] = (
     ),
 )
 
+# 多文件场景额外一条：doctor 不再报税率。多出来的那条 Drive 断言
+# 必须也有变异体证明它会开火 —— 否则这条断言就是「写了没人验」。
+MUTATIONS_MULTI: tuple[tuple[str, str, str, str], ...] = MUTATIONS + (
+    (
+        "doctor_missing_rate", "shop/cli.py",
+        'print(f"SHOP_READY version={VERSION} rate={TAX_RATE:.2f}")',
+        'print(f"SHOP_READY version={VERSION}")',
+    ),
+)
+
 
 @dataclass(frozen=True, slots=True)
 class MutationCase:
@@ -87,15 +97,21 @@ def _apply(tree, relpath: str, old: str, new: str) -> None:
 
 
 def _probe(tree, skill: GeneratedSkill, run_root: Path,
-           label: str, mutations: tuple[tuple[str, str, str, str], ...] = ()) -> tuple[bool, str, bool]:
+           label: str, mutations: tuple[tuple[str, str, str, str], ...] = (),
+           baseline_files: dict[str, str] | None = None) -> tuple[bool, str, bool]:
     """每个变体从**内容干净**的基线重新写起，等价于一份干净副本。
 
     这里刻意只用一个 worktree：变异测试串行执行，逐次重写两个文件即可保证
     基线不被上一个变体污染；真正的「干净环境」边界在 verifier 的独立 worktree
     （git apply 重放作者 diff），不需要为每个变体再付一次 git worktree add 的代价。
+
+    `baseline_files` 必须与 skill 的期望一致：多文件场景的干净基线是
+    「两个文件都改对」的状态，否则基线本身就不绿，变异门禁会误判。
     """
-    tree.write_file("shop/pricing.py", PRICING_CORRECT)
-    tree.write_file("shop/cli.py", CLI_SOURCE)
+    for rel, content in (baseline_files or {
+        "shop/pricing.py": PRICING_CORRECT, "shop/cli.py": CLI_SOURCE,
+    }).items():
+        tree.write_file(rel, content)
     for _name, relpath, old, new in mutations:
         _apply(tree, relpath, old, new)
     run_dir = run_root / f"{label}-{uuid.uuid4().hex[:8]}"
@@ -108,15 +124,20 @@ def run_mutation_suite(
     skill: GeneratedSkill,
     workspace: GitWorkspace,
     run_root: Path,
+    *,
+    baseline_files: dict[str, str] | None = None,
+    mutations: tuple[tuple[str, str, str, str], ...] = MUTATIONS,
 ) -> MutationReport:
     run_root.mkdir(parents=True, exist_ok=True)
     tree = workspace.worktree("mutations")
-    baseline_green, baseline_out, _ = _probe(tree, skill, run_root, "baseline")
+    baseline_green, baseline_out, _ = _probe(
+        tree, skill, run_root, "baseline", baseline_files=baseline_files)
 
     cases: list[MutationCase] = []
-    for name, relpath, old, new in MUTATIONS:
+    for name, relpath, old, new in mutations:
         ok, out, executed = _probe(tree, skill, run_root, name,
-                                   ((name, relpath, old, new),))
+                                   ((name, relpath, old, new),),
+                                   baseline_files=baseline_files)
         cases.append(MutationCase(
             name=name, target=relpath,
             baseline_ok=baseline_green,

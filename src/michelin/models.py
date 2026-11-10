@@ -97,6 +97,8 @@ class ModelAdapter(Protocol):
 
     def complete(self, prompt: str) -> ModelResponse: ...
 
+    def complete_chat(self, messages: list[dict]) -> ModelResponse: ...
+
 
 @dataclass(frozen=True, slots=True)
 class IndependenceWaiver:
@@ -142,8 +144,16 @@ class ScriptedModel:
         self.calls = 0
 
     def complete(self, prompt: str) -> ModelResponse:
+        return self.complete_chat([{"role": "user", "content": prompt}])
+
+    def complete_chat(self, messages: list[dict]) -> ModelResponse:
+        """多轮对话：工具循环（读文件 → 再决定）需要它。
+
+        脚本模型按顺序吐预设回复；真实模型把 messages 原样发给 provider。
+        """
         idx = min(self.calls, len(self.script) - 1)
         self.calls += 1
+        prompt = "\n".join(str(m.get("content", "")) for m in messages)
         return ModelResponse(
             text=self.script[idx],
             model_family=self.family,
@@ -226,15 +236,18 @@ class OpenAICompatModel:
         self.last_usage = ModelUsage()
 
     # ---------- 内部 ----------
-    def _payload(self, prompt: str) -> bytes:
+    def _payload_messages(self, messages: list[dict]) -> bytes:
         body: dict = {
             "model": self.version,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "temperature": 0,
         }
         if self.max_tokens:
             body["max_tokens"] = self.max_tokens
         return json.dumps(body).encode("utf-8")
+
+    def _payload(self, prompt: str) -> bytes:
+        return self._payload_messages([{"role": "user", "content": prompt}])
 
     @staticmethod
     def _safe_error(exc: urllib.error.HTTPError) -> str:
@@ -246,7 +259,11 @@ class OpenAICompatModel:
 
     # ---------- 对外 ----------
     def complete(self, prompt: str) -> ModelResponse:
-        data = self._payload(prompt)
+        return self.complete_chat([{"role": "user", "content": prompt}])
+
+    def complete_chat(self, messages: list[dict]) -> ModelResponse:
+        """多轮对话：工具循环需要它（读文件 → 再决定改什么）。"""
+        data = self._payload_messages(messages)
         last_error: Exception | None = None
         for attempt in range(self.attempts):
             req = urllib.request.Request(
@@ -293,7 +310,7 @@ class OpenAICompatModel:
             text=text,
             model_family=self.family,
             model_version=self.version,
-            prompt_hash=sha256_text(prompt),
+            prompt_hash=sha256_text("\n".join(str(m.get("content", "")) for m in messages)),
             usage=usage,
             provider_request_id=str(payload.get("id") or ""),
             finish_reason=str(choice.get("finish_reason") or ""),
@@ -317,7 +334,11 @@ class MeteredModel:
         self.total_usage = ModelUsage(external_requests=0)
 
     def complete(self, prompt: str) -> ModelResponse:
-        response = self.inner.complete(prompt)
+        return self.complete_chat([{"role": "user", "content": prompt}])
+
+    def complete_chat(self, messages: list[dict]) -> ModelResponse:
+        """多轮也要计量：工具循环每一轮都是一次真实调用。"""
+        response = self.inner.complete_chat(messages)
         usage = response.usage
         self.total_usage = ModelUsage(
             input_tokens=self.total_usage.input_tokens + usage.input_tokens,

@@ -749,6 +749,45 @@ class Gate:
             evidence["summary"] += f"；⚠️ P2 输出格式探针失败（parsed={rate!r}）"
             return False, evidence
         evidence["summary"] += f"；P2 输出格式探针通过（TAX_RATE = {rate}）"
+
+        # 第三问：真实模型能否按多文件 EDIT 协议产出？协议不通用 = 多文件路径不可用。
+        from michelin.workers.editing_worker import parse_actions
+
+        edit_probe = OpenAICompatModel(
+            os.getenv("MW_WORKER_MODEL", "deepseek-flash"), api_base=base, max_tokens=600
+        )
+        ep = edit_probe.complete(
+            "按下面的协议，把 shop/pricing.py 里的税率改成 0.06。只输出协议块，不要解释。\n"
+            "=== BEGIN FILE: shop/pricing.py ===\n"
+            "TAX_RATE = 0.06\n"
+            "=== END FILE ==="
+        )
+        try:
+            action = parse_actions(ep.text)
+            edit_paths = [e.path for e in action.edits]
+            edit_ok = bool(action.edits) and all(
+                e.path.startswith("shop/") for e in action.edits
+            )
+            edit_reason = ""
+        except Exception as exc:  # 解析失败也是「协议不可用」
+            edit_paths, edit_ok = [], False
+            edit_reason = f"{type(exc).__name__}: {exc}"
+        evidence["p7_edit_protocol_probe"] = {
+            "model": edit_probe.version,
+            "text_preview": ep.text[:160].replace("\n", "\\n"),
+            "parsed_paths": edit_paths,
+            "ok": edit_ok,
+            "reason": edit_reason,
+            "usage": ep.usage.to_dict(),
+        }
+        if not edit_ok:
+            evidence["reason"] = (
+                "真实模型未能按多文件 EDIT 协议产出可解析的编辑块"
+                + (f"：{edit_reason}" if edit_reason else "")
+            )
+            evidence["summary"] += "；⚠️ P7 EDIT 协议探针失败"
+            return False, evidence
+        evidence["summary"] += f"；P7 EDIT 协议探针通过（{edit_paths}）"
         return ok, evidence
 
     def check_no_secret_in_repo(self):

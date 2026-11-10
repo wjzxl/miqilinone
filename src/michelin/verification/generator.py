@@ -41,6 +41,7 @@ from pathlib import Path
 APP_MODULE = "shop.cli"
 EXPECTED_TOTAL = "__EXPECTED_TOTAL__"
 PROBE_ARGS = __PROBE_ARGS__
+EXTRA_DRIVE_CHECKS = __EXTRA_DRIVE_CHECKS__
 
 
 def root() -> Path:
@@ -217,10 +218,22 @@ DRIVE_CHECKS_REAL = '''    if r.returncode != 0:
     if recorded != stdout:
         print("DRIVE_FAIL side effect mismatch: receipt=" + repr(recorded)
               + " stdout=" + repr(stdout))
-        return 1'''
+        return 1
+__EXTRA_DRIVE_BODY__'''
 
 DRIVE_CHECKS_WEAKENED = '''    # 故意弱化：门禁形同虚设，变异测试必须能抓到这一点。
     pass'''
+
+# 额外断言体：任务要改多个文件时，每条断言负责一个文件。
+# 默认 spec 没有额外断言 → 这段是空的，行为与之前完全一致。
+EXTRA_DRIVE_BODY_REAL = '''
+    for chk in EXTRA_DRIVE_CHECKS:
+        rc = cli(*chk["command"])
+        if rc.returncode != 0 or chk["expect"] not in rc.stdout:
+            print("DRIVE_FAIL " + chk["label"] + ": " + repr(rc.stdout.strip())
+                  + " stderr=" + repr(rc.stderr.strip()))
+            return 1
+'''
 
 CLEANUP_BODY_REAL = '''    shutil.rmtree(instance_dir(), ignore_errors=True)
     if "VERIFY_EATS_EVIDENCE" in os.environ:
@@ -264,14 +277,21 @@ class GeneratedSkill:
     cleanup_eats_evidence: bool
 
 
-def _render_helper(*, weaken_drive: bool, eats_evidence: bool) -> str:
+def _render_helper(*, weaken_drive: bool, eats_evidence: bool,
+                   extra_drive_checks: tuple = ()) -> str:
     text = HELPER_TEMPLATE
     text = text.replace("__EXPECTED_TOTAL__", EXPECTED_TOTAL)
     text = text.replace("__PROBE_ARGS__", repr(tuple(PROBE_ARGS)))
     text = text.replace("__DRIVE_CHECKS__", DRIVE_CHECKS_WEAKENED if weaken_drive else DRIVE_CHECKS_REAL)
     text = text.replace("__CLEANUP_BODY__", CLEANUP_BODY_EATS if eats_evidence else CLEANUP_BODY_REAL)
+    checks = [c.to_dict() for c in extra_drive_checks]
+    text = text.replace("__EXTRA_DRIVE_CHECKS__", repr(checks))
+    # 弱化 Drive 时额外断言也一并失效 —— 否则「门禁形同虚设」的对照就不成立。
+    text = text.replace("__EXTRA_DRIVE_BODY__",
+                        "" if weaken_drive else (EXTRA_DRIVE_BODY_REAL if checks else ""))
     leftovers = [t for t in (
-        "__EXPECTED_TOTAL__", "__PROBE_ARGS__", "__DRIVE_CHECKS__", "__CLEANUP_BODY__"
+        "__EXPECTED_TOTAL__", "__PROBE_ARGS__", "__DRIVE_CHECKS__", "__CLEANUP_BODY__",
+        "__EXTRA_DRIVE_CHECKS__", "__EXTRA_DRIVE_BODY__",
     ) if t in text]
     if leftovers:
         raise ValueError(f"helper 模板存在未替换的占位符: {leftovers}")
@@ -395,7 +415,8 @@ def generate_skill(
     files: dict[str, str] = {"SKILL.md": _render_skill_md(spec)}
     files.update(_render_features(spec))
     files["helpers/verify_helper.py"] = _render_helper(
-        weaken_drive=weaken_drive, eats_evidence=cleanup_eats_evidence
+        weaken_drive=weaken_drive, eats_evidence=cleanup_eats_evidence,
+        extra_drive_checks=spec.extra_drive_checks,
     )
     for rel, body in files.items():
         path = root / rel

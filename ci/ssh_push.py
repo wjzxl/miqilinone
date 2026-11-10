@@ -124,6 +124,19 @@ def build_commit(base_ref: str, source_ref: str, source_files: list[str], messag
         run(["git", "-C", str(ROOT), "worktree", "remove", "--force", str(worktree)])
 
 
+def mirror_commit(base_ref: str, source_ref: str, message: str) -> str:
+    """做一个「树 = 本地 source_ref 整棵树」的提交。
+
+    与 build_commit 的区别：后者是在 base 的树上**合并**改动（远端独有的文件会保留），
+    前者是**整树替换**（远端有、本地没有的文件会被删除）。用它清理远端的
+    历史遗留 / 误推产物，同时保持 fast-forward（父提交仍是 base）。
+    """
+    tree = run(["git", "-C", str(ROOT), "rev-parse", f"{source_ref}^{{tree}}"]).strip()
+    base_sha = run(["git", "-C", str(ROOT), "rev-parse", f"{base_ref}^{{commit}}"]).strip()
+    commit = run(["git", "-C", str(ROOT), "commit-tree", tree, "-p", base_sha, "-m", message])
+    return commit.strip()
+
+
 def push(repo: str, local_sha: str, remote_branch: str, identity: Path) -> str:
     env = ssh_env(identity)
     url = SSH_URL_TEMPLATE.format(repo=repo)
@@ -181,6 +194,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--base", default="main", help="远端基线分支")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-pr", action="store_true", help="只推分支，不开 PR")
+    ap.add_argument("--mirror-tree", action="store_true",
+                    help="main 直接用本地整棵树替换（会删除远端有、本地没有的文件）")
     ap.add_argument("--close-old-pr", type=int, default=0,
                     help="新 PR 开好后，关闭这个编号的旧 PR（0 表示不关）")
     args = ap.parse_args(argv)
@@ -210,11 +225,17 @@ def main(argv: list[str] | None = None) -> int:
 
     workdir = Path(tempfile.mkdtemp(prefix="mw-ssh-push-"))
     try:
-        main_sha = build_commit(
-            f"origin/{args.base}", args.local_ref, changed,
-            "ci: 通过 SSH 通道补齐 workflow 文件并同步 CI 推送工具",
-            workdir,
-        )
+        if args.mirror_tree:
+            main_sha = mirror_commit(
+                f"origin/{args.base}", args.local_ref,
+                "ci: 同步为本地工程树的完整快照（整树替换，清理远端遗留文件）",
+            )
+        else:
+            main_sha = build_commit(
+                f"origin/{args.base}", args.local_ref, changed,
+                "ci: 通过 SSH 通道补齐 workflow 文件并同步 CI 推送工具",
+                workdir,
+            )
         print(f"new main commit: {main_sha[:12]}")
 
         # PR 分支必须**从新的 main 派生**，否则 PR 的 diff 会把 main 上的

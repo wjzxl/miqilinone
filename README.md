@@ -5,8 +5,9 @@
 > 调度、执行、裁决三权分离；每一次交付都带一条 append-only 哈希证据链，
 > 门禁未证明就不得派发。
 
-本仓库是一个**可运行**的工程骨架（P0–P5），不是设计稿：13 项 CI 门禁在本地与
-GitHub Actions 等价环境里都能逐项跑出证据。
+本仓库是一个**可运行**的工程骨架（P0–P5），不是设计稿：13 项 CI 门禁已在
+**真实的 GitHub Actions** 上跑通（push 与 pull_request 两个 run 均 13/13 通过，
+`gate-report.json` artifact 可下载复核）。
 
 ---
 

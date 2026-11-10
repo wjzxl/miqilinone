@@ -28,6 +28,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
@@ -74,15 +75,37 @@ def _keychain_read(service: str, account: str) -> str | None:
 def copilot_cli_token(login: str) -> str | None:
     """取 GitHub Copilot CLI 为 `login` 保存的 GitHub token。
 
-    CLI 登录后把凭证存在钥匙串 service=`copilot-cli`、
-    account=`https://github.com:<login>:github`；本地 `~/.copilot/data.db` 的
-    accounts 表只记录 login，不存 token 本身，所以必须走钥匙串。
+    CLI 登录后把凭证存在钥匙串 service=`copilot-cli`，account 形如
+    `https://github.com:<login>:github`（不同版本后缀可能不同）。
+    本地 `~/.copilot/data.db` 的 accounts 表只记录 login，不存 token 本身，
+    所以必须走钥匙串。
     """
-    for account in (COPILOT_CLI_ACCT.format(login=login), login):
+    candidates = [
+        COPILOT_CLI_ACCT.format(login=login),
+        f"https://github.com:{login}",
+        login,
+    ]
+    for account in candidates:
         value = _keychain_read(COPILOT_CLI_SERVICE, account)
         if value:
             return value
-    return None
+    # 兜底：取 service 下的第一条目，看它的 acct 是否指向目标账号。
+    try:
+        proc = subprocess.run(
+            ["security", "find-generic-password", "-s", COPILOT_CLI_SERVICE],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    match = re.search(r'"acct"<blob>="([^"]*)"', proc.stdout)
+    if not match:
+        return None
+    acct = match.group(1)
+    if login not in acct:
+        return None
+    return _keychain_read(COPILOT_CLI_SERVICE, acct)
 
 
 def _git_credential_token() -> str | None:
@@ -426,6 +449,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--root", default=str(ROOT))
     ap.add_argument("--dry-run", action="store_true", help="只做权限预检与文件统计，不写远端")
     ap.add_argument("--no-pr", action="store_true", help="只推 main，不开 PR")
+    ap.add_argument("--pr-only", action="store_true",
+                    help="不开新 commit，只基于远端已有 main 开探针 PR")
     ap.add_argument("--only-workflows", action="store_true",
                     help="只推 .github/workflows/ 下的文件（凭证升级到有 workflow 权限后补推用）")
     ap.add_argument("--capabilities", action="store_true",
@@ -495,15 +520,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     result: dict = {"repo": repo, "base": args.base}
-    result["push"] = push_main(gh, root, args.base, files)
-    print(f"pushed {args.base}: {result['push']['commit'][:12]} ({len(files)} files)")
-    skipped = result["push"].get("skipped_files") or []
-    if skipped:
-        print(f"\n注意：{len(skipped)} 个 workflow 文件未能写入（凭证缺 workflow 权限）：",
-              file=sys.stderr)
-        for path in skipped:
-            print(f"  - {path}", file=sys.stderr)
-        print(workflow_scope_hint(), file=sys.stderr)
+    if args.pr_only:
+        result["push"] = {"skipped": True, "reason": "--pr-only：不改动远端 main"}
+        print("pr-only: 复用远端已有 main，不产生新 commit")
+    else:
+        result["push"] = push_main(gh, root, args.base, files)
+        print(f"pushed {args.base}: {result['push']['commit'][:12]} ({len(files)} files)")
+        skipped = result["push"].get("skipped_files") or []
+        if skipped:
+            print(f"\n注意：{len(skipped)} 个 workflow 文件未能写入（凭证缺 workflow 权限）：",
+                  file=sys.stderr)
+            for path in skipped:
+                print(f"  - {path}", file=sys.stderr)
+            print(workflow_scope_hint(), file=sys.stderr)
     if not args.no_pr:
         result["pr"] = open_pr(gh, args.base, args.branch, files)
         print(f"opened PR #{result['pr']['pr_number']}: {result['pr']['pr_url']}")

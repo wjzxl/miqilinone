@@ -15,6 +15,7 @@ data/p3-runs/
 data/ci/runs/
 data/ci/pr-repos/
 data/ci/gate-report*.json
+data/ci/workflow-create-url.txt
 data/p4-drafts/
 data/p5-runs/
 data/external-repos/

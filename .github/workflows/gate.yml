@@ -1,0 +1,57 @@
+name: michelin-p5-gate
+
+# CI 里没有第二套门禁逻辑：这里只负责准备运行时 + 调用仓库内的唯一入口。
+# 本地复现同一结果：python3 ci/gate.py --report data/ci/gate-report.json
+# PR 时 gate.py 的 pr_rules_scan / pr_diff_gate 走真实三方 diff，因此必须先把
+# base 分支取到本地 ref（显式 refspec，避免只写 FETCH_HEAD 而找不到 origin/<base>）。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout (full history for PR diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch PR base ref for incremental diff
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}" --depth=1
+          git rev-parse "origin/${{ github.base_ref }}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # rules/*.yml 是给真正的 ast-grep CLI 消费的资产，CI 必须有这个二进制。
+      # pin 小版本：0.51.1 是本机实测过的 CLI 行为（scan --rule <one.yml> --json <files>）。
+      - name: Install ast-grep CLI
+        run: python3 -m pip install "ast-grep-cli>=0.51,<0.52"
+
+      - name: Verify toolchain
+        run: |
+          python3 -V
+          ast-grep --version
+
+      - name: Run the single gate entrypoint
+        run: python3 ci/gate.py --report data/ci/gate-report.json
+
+      # 报告含每一项检查的证据（事件链、变异命中、PR 文件列表），失败时也要留档。
+      - name: Upload gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: michelin-gate-report
+          path: data/ci/gate-report.json
+          if-no-files-found: warn

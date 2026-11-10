@@ -99,17 +99,24 @@ def collect_diff_files(local_ref: str, base_ref: str) -> list[str]:
 
 
 def build_commit(base_ref: str, source_ref: str, source_files: list[str], message: str,
-                 workdir: Path) -> str:
+                 workdir: Path, probe_target: str | None = None) -> str:
     """在 base_ref 之上做一次只含指定文件的提交，返回新 commit SHA。
 
     文件内容取自 source_ref（本地已提交的内容），不是 base_ref —— 因为
     `.github/workflows/gate.yml` 在远端 base 里根本不存在，从 base 取会失败。
+
+    probe_target 不为空时，额外在该文件末尾追加一行探针注释（PR 增量路径的靶子）。
     """
     worktree = workdir / f"wt-{abs(hash(message)) % 10000}"
     run(["git", "-C", str(ROOT), "worktree", "add", "--detach", "-q", str(worktree), base_ref])
     try:
         if source_files:
             run(["git", "-C", str(worktree), "checkout", source_ref, "--"] + source_files)
+        if probe_target:
+            target = worktree / probe_target
+            data = target.read_bytes()
+            if PROBE_LINE.encode("utf-8") not in data:
+                target.write_bytes(data + PROBE_LINE.encode("utf-8"))
         run(["git", "-C", str(worktree), "add", "-A"])
         run(["git", "-C", str(worktree), "commit", "-q", "-m", message])
         return run(["git", "-C", str(worktree), "rev-parse", "HEAD"]).strip()
@@ -124,6 +131,28 @@ def push(repo: str, local_sha: str, remote_branch: str, identity: Path) -> str:
     return out.strip()
 
 
+def open_pr_via_api(repo: str, head: str, base: str, title: str, body: str) -> dict:
+    """用 GitHub API 开 PR（开 PR 不涉及 workflow 目录，API 通道可用）。"""
+    sys.path.insert(0, str(ROOT / "ci"))
+    from github_api_push import GitHub, resolve_token  # noqa: PLC0415
+
+    token, source = resolve_token(repo.split("/", 1)[0])
+    gh = GitHub(token, repo)
+    pr = gh.pull(title=title, head=head, base=base, body=body)
+    print(f"opened PR #{pr['number']}: {pr['html_url']}（凭证来源 {source}）")
+    return pr
+
+
+def close_pr_via_api(repo: str, number: int) -> None:
+    sys.path.insert(0, str(ROOT / "ci"))
+    from github_api_push import GitHub, resolve_token  # noqa: PLC0415
+
+    token, _ = resolve_token(repo.split("/", 1)[0])
+    gh = GitHub(token, repo)
+    gh.request("PATCH", f"/repos/{repo}/pulls/{number}", {"state": "closed"})
+    print(f"closed PR #{number}（旧的探针 PR，分支基线已过时）")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="SSH 通道推送（无 scope 限制，可写 .github/workflows）")
     ap.add_argument("--repo", default="wjzxl/miqilinone", help="owner/name")
@@ -132,6 +161,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pr-branch", default="gate/pr-probe", help="PR 分支名")
     ap.add_argument("--base", default="main", help="远端基线分支")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--no-pr", action="store_true", help="只推分支，不开 PR")
+    ap.add_argument("--close-old-pr", type=int, default=0,
+                    help="新 PR 开好后，关闭这个编号的旧 PR（0 表示不关）")
     args = ap.parse_args(argv)
 
     identity = Path(args.identity).expanduser()
@@ -166,22 +198,38 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"new main commit: {main_sha[:12]}")
 
-        # PR 分支只同步「工具 + workflow」两个文件；探针行本来就在该分支上，
-        # 不重复添加，否则 diff 里会出现两行探针注释。
-        probe_sha = build_commit(
-            f"origin/{args.pr_branch}", args.local_ref, changed,
-            "ci: 同步 workflow 与工具改动（PR diff 仍只含探针行）",
+        # PR 分支必须**从新的 main 派生**，否则 PR 的 diff 会把 main 上的
+        # README/docs/工具改动一起算进来，「增量只扫 1 个文件」就演示不出来了。
+        # 从新的 main 派生的分支与旧分支没有共同的新祖先，只能用新分支名 +
+        # 新 PR（旧 PR 关闭），这样全程 fast-forward，不需要 force push。
+        pr_branch = f"{args.pr_branch}-v2"
+        pr_sha = build_commit(
+            main_sha, args.local_ref, [],
+            "test: PR 门禁增量路径探针（只改一个 .py，无规则违规）",
             workdir,
+            probe_target=PROBE_TARGET,
         )
-        print(f"new pr commit:   {probe_sha[:12]}")
+        print(f"new pr commit:   {pr_sha[:12]} (branch {pr_branch})")
 
         push(args.repo, main_sha, args.base, identity)
         print(f"pushed {args.base} <- {main_sha[:12]}")
-        push(args.repo, probe_sha, args.pr_branch, identity)
-        print(f"pushed {args.pr_branch} <- {probe_sha[:12]}")
+        push(args.repo, pr_sha, pr_branch, identity)
+        print(f"pushed {pr_branch} <- {pr_sha[:12]}")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
+    if args.no_pr:
+        return 0
+
+    pr = open_pr_via_api(
+        args.repo, pr_branch, args.base,
+        "[CI drill] 验证真实 PR 增量门禁",
+        "门禁闭环验证 PR：只修改 `src/michelin/__init__.py` 一行注释。\n\n"
+        "期望 `pr_rules_scan` 走 `origin/main...HEAD` 增量 diff（只扫这 1 个文件）、"
+        "13/13 GATE GREEN，并上传 `gate-report.json` artifact。",
+    )
+    if args.close_old_pr:
+        close_pr_via_api(args.repo, args.close_old_pr)
     return 0
 
 

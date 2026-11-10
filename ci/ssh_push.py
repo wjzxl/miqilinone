@@ -83,12 +83,18 @@ def collect_diff_files(local_ref: str, base_ref: str) -> list[str]:
        与本地 main **没有共同祖先**，三点 diff 会退化。
     2. 只保留本地 ref 里存在的路径 —— 远端独有、本地没有的文件（如仓库原有的 README.md）
        绝不能进提交，否则这次「同步」会把它删掉。
+
+    路径必须用 `-c core.quotepath=false` 取：git 默认会把非 ASCII 路径转义成
+    `docs/\\346\\231...`，那样再拿去 `cat-file -e` 必然失败，会把真实存在的
+    中文路径文件误判成「远端独有」。
     """
-    out = run(["git", "-C", str(ROOT), "diff", "--name-only", base_ref, local_ref])
+    out = run(["git", "-C", str(ROOT), "-c", "core.quotepath=false",
+               "diff", "--name-only", base_ref, local_ref])
     changed: list[str] = []
     for rel in (line for line in out.splitlines() if line.strip()):
         exists = subprocess.run(
-            ["git", "-C", str(ROOT), "cat-file", "-e", f"{local_ref}:{rel}"],
+            ["git", "-C", str(ROOT), "-c", "core.quotepath=false",
+             "cat-file", "-e", f"{local_ref}:{rel}"],
             capture_output=True,
         )
         if exists.returncode == 0:

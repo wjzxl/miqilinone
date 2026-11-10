@@ -218,9 +218,14 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     print(f"ssh: {greeting.splitlines()[0]}")
 
+    # base 必须取到；PR 分支可能已被删除（比如上一轮收尾），取不到不该中断。
     run(["git", "-C", str(ROOT), "fetch", "-q", "origin",
-         f"+refs/heads/{args.base}:refs/remotes/origin/{args.base}",
-         f"+refs/heads/{args.pr_branch}:refs/remotes/origin/{args.pr_branch}"])
+         f"+refs/heads/{args.base}:refs/remotes/origin/{args.base}"])
+    subprocess.run(
+        ["git", "-C", str(ROOT), "fetch", "-q", "origin",
+         f"+refs/heads/{args.pr_branch}:refs/remotes/origin/{args.pr_branch}"],
+        capture_output=True, text=True,
+    )
 
     changed = collect_diff_files(args.local_ref, f"origin/{args.base}")
     print(f"远端 {args.base} 与本地 {args.local_ref} 的差异文件（待同步）：{changed}")
@@ -243,6 +248,12 @@ def main(argv: list[str] | None = None) -> int:
                 workdir,
             )
         print(f"new main commit: {main_sha[:12]}")
+
+        if args.no_pr:
+            # 只同步 main 时不该留下探针分支（上一版会推一个没有 PR 的孤儿分支）。
+            push(args.repo, main_sha, args.base, identity)
+            print(f"pushed {args.base} <- {main_sha[:12]}")
+            return 0
 
         # PR 分支必须**从新的 main 派生**，否则 PR 的 diff 会把 main 上的
         # README/docs/工具改动一起算进来，「增量只扫 1 个文件」就演示不出来了。

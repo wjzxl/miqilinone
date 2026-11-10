@@ -716,9 +716,12 @@ class Gate:
                 "summary": "未配置模型密钥 → 跳过真实模型冒烟（CI 不依赖密钥）",
             }
         model = OpenAICompatModel(
-            os.getenv("MW_WORKER_MODEL", "deepseek-flash"), api_base=base, max_tokens=32
+            os.getenv("MW_WORKER_MODEL", "deepseek-flash"), api_base=base, max_tokens=256
         )
         response = model.complete("只回答一个词：OK")
+        # 推理模型会把 max_tokens 先花在 reasoning 上：**预算太小会让正文为空**，
+        # 而且是概率性的（这次推理短就过、下次全用完就挂）—— 门禁不能是随机的。
+        # max_tokens 给足，并把「空正文」和「模型没答」分成两种可诊断的失败。
         ok = bool(response.text.strip()) and response.usage.total_tokens > 0
         evidence = {
             "summary": (f"{model.version} 调用成功：{response.usage.total_tokens} tokens "
@@ -728,8 +731,22 @@ class Gate:
             "model": model.version,
             "usage": response.usage.to_dict(),
             "provider_request_id": response.provider_request_id,
+            "finish_reason": response.finish_reason,
             "text_preview": response.text[:80],
         }
+        if not ok:
+            if not response.text.strip():
+                evidence["reason"] = (
+                    f"模型返回空正文（finish_reason={response.finish_reason!r}，"
+                    f"reasoning={response.usage.reasoning_tokens}）："
+                    "max_tokens 被推理吃光，探针预算不足"
+                )
+                evidence["summary"] = (f"{model.version} 调用了但正文为空 "
+                                        f"(reasoning={response.usage.reasoning_tokens}, "
+                                        f"finish_reason={response.finish_reason})")
+            else:
+                evidence["reason"] = "模型没有回报 token 用量"
+            return False, evidence
 
         # 第二问：真实模型能不能产出 P2 worker 需要的**可机械检查**格式？
         # 这是真实模型路径最容易出问题的地方（模型可能回 6%、回整段文件、
@@ -737,7 +754,7 @@ class Gate:
         from michelin.workers.git_worker import _RATE_RE, _has_percent_suffix
 
         probe = OpenAICompatModel(
-            os.getenv("MW_WORKER_MODEL", "deepseek-flash"), api_base=base, max_tokens=128
+            os.getenv("MW_WORKER_MODEL", "deepseek-flash"), api_base=base, max_tokens=512
         )
         p2 = probe.complete(
             "只回答一行赋值，格式为 `TAX_RATE = <数值>`。\n"

@@ -263,6 +263,42 @@ def isolated_run(
     )
 
 
+def rlimit_disclosure(receipt: "IsolationReceipt") -> dict[str, bool]:
+    """校验 rlimit 证据是否诚实 —— **平台无关**的不变量。
+
+    曾经的 bug：把「macOS 会忽略 RLIMIT_AS」写成了硬断言，于是 Linux 上
+    4 个 limit 全部生效（更好的结果）反而被判红。平台差异不是不变式。
+
+    真正的不变量有四条：
+      1. 子进程回报了**实测值**（effective 非空），而不是父进程复述请求；
+      2. **至少有一项真的生效** —— 否则「实测」可能只是回显声明；
+      3. `rlimits_ignored` **恰好**等于「请求了但实测没生效」的集合（不多报也不漏报）；
+      4. `enforcement` 里的文字声明与数据一致：全部生效时不许假装有缺口，
+         有缺口时必须点名是哪几个。
+    """
+    requested = dict(receipt.rlimits_requested)
+    effective = dict(receipt.rlimits_effective)
+    ignored = set(receipt.rlimits_ignored)
+    expected_ignored = {name for name, value in requested.items()
+                        if effective.get(name) != value}
+    enforced = {name for name, value in requested.items()
+                if effective.get(name) == value}
+    note = receipt.enforcement.get("rlimits", "")
+    if expected_ignored:
+        note_ok = ("platform ignored" in note
+                   and all(name in note for name in expected_ignored))
+    else:
+        # 全部生效时，声明里不许出现「platform ignored」，也不许报一个更差的数字。
+        note_ok = ("platform ignored" not in note
+                   and f"{len(enforced)}/{len(requested)}" in note)
+    return {
+        "measured_not_empty": bool(effective),
+        "at_least_one_enforced": bool(enforced),
+        "ignored_set_exact": ignored == expected_ignored,
+        "note_matches_data": note_ok,
+    }
+
+
 def container_command(argv: tuple[str, ...] | list[str], *, policy: SandboxPolicy,
                       source_root: Path, workdir: Path) -> tuple[str, ...]:
     """生产接缝：生成等价的容器命令（本函数不执行，CI 也不依赖 Docker）。

@@ -5,13 +5,16 @@
 本包不改 P0–P4 的任何协议，所有状态落在 run 自己的目录下。
 """
 
-from .sandbox import IsolationReceipt, SandboxPolicy, container_command, isolated_run
+from .sandbox import (
+    IsolationReceipt, SandboxPolicy, container_command, isolated_run, rlimit_disclosure,
+)
 from .telemetry import SpanLog, Tracer
 from .budget import Budget, BudgetExceeded, BudgetGuard, Charge
 from .harness import RunHarness
 
 __all__ = [
     "IsolationReceipt", "SandboxPolicy", "container_command", "isolated_run",
+    "rlimit_disclosure",
     "SpanLog", "Tracer", "Budget", "BudgetExceeded", "BudgetGuard", "Charge",
     "RunHarness",
 ]

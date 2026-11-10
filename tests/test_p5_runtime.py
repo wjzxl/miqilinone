@@ -1,7 +1,8 @@
 """P5 运行时层：隔离证据 / span 链可证伪 / 预算熔断黏性 / 账本可重放。
 
-刻意不做「看起来都对」的断言：macOS 会忽略 RLIMIT_AS，测试要求这个缺口被如实
-记录；文件系统与网络边界必须标成 declared-only，不许把声明冒充强制。
+刻意不做「看起来都对」的断言：文件系统与网络边界必须标成 declared-only，
+不许把声明冒充强制；rlimit 的披露必须与实测严格一致（**但不预设平台一定会
+忽略某一项** —— 那是平台特性，不是本系统的不变式）。
 """
 
 from __future__ import annotations
@@ -18,8 +19,9 @@ from _path import *  # noqa: F401,F403
 
 from michelin.platform.envelope import SEMCONV_VERSION  # noqa: E402
 from michelin.runtime import (  # noqa: E402
-    Budget, BudgetExceeded, BudgetGuard, Charge, RunHarness, SandboxPolicy,
-    SpanLog, Tracer, container_command, isolated_run,
+    Budget, BudgetExceeded, BudgetGuard, Charge, IsolationReceipt, RunHarness,
+    SandboxPolicy, SpanLog, Tracer, container_command, isolated_run,
+    rlimit_disclosure,
 )
 
 PY = sys.executable
@@ -54,14 +56,59 @@ class TestSandbox(unittest.TestCase):
         self.assertEqual(env["PYTHONNOUSERSITE"], "1")
 
     def test_rlimits_are_measured_not_claimed(self) -> None:
+        """断言的是**平台无关**的不变量，不是「本平台必须忽略某个 limit」。
+
+        曾经的 bug：这里硬断言「至少有一个被忽略的 rlimit」，那是 macOS 的行为；
+        在 Linux 上 4 个 limit 全部生效（更好的结果）却被判红 —— 真实 CI
+        （GitHub Actions / ubuntu）第一次跑就红了。平台差异不是不变式。
+        """
         rec = isolated_run([PY, "-S", "-c", "print(1)"], label="limits",
                           workdir=self.tmp / "run")
-        self.assertEqual(rec.rlimits_effective.get("RLIMIT_CPU"),
-                         rec.rlimits_requested["RLIMIT_CPU"])
-        self.assertEqual(rec.rlimits_effective.get("RLIMIT_FSIZE"),
-                         rec.rlimits_requested["RLIMIT_FSIZE"])
-        self.assertTrue(rec.rlimits_ignored, "本平台应当至少暴露一个被忽略的 rlimit")
-        self.assertIn("platform ignored", rec.enforcement["rlimits"])
+        self.assertTrue(rec.rlimits_effective, "子进程必须回报实测读回值")
+        disclosure = rlimit_disclosure(rec)
+        self.assertTrue(all(disclosure.values()),
+                        f"rlimit 证据不诚实：{disclosure} "
+                        f"requested={rec.rlimits_requested} effective={rec.rlimits_effective} "
+                        f"ignored={rec.rlimits_ignored} note={rec.enforcement['rlimits']}")
+        # 至少要有一项真的生效，否则「实测」可能只是回显父进程的声明。
+        enforced = [k for k, v in rec.rlimits_requested.items()
+                    if rec.rlimits_effective.get(k) == v]
+        self.assertTrue(enforced, "没有任何 rlimit 真的生效，机制本身可疑")
+        # 忽略集合必须与「请求了但没生效」严格一致：不多报也不漏报。
+        expected_ignored = {k for k, v in rec.rlimits_requested.items()
+                            if rec.rlimits_effective.get(k) != v}
+        self.assertEqual(set(rec.rlimits_ignored), expected_ignored)
+
+    def test_rlimit_disclosure_is_platform_independent(self) -> None:
+        """用合成证据覆盖两种平台分支：全部生效 / 部分被忽略。
+
+        不依赖真实平台行为，因此任何 CI 上都能验证披露逻辑本身是对的。
+        """
+        def make(ignored: tuple[str, ...], note: str) -> IsolationReceipt:
+            requested = {"RLIMIT_CPU": 10, "RLIMIT_AS": 1073741824,
+                         "RLIMIT_FSIZE": 33554432, "RLIMIT_NOFILE": 256}
+            effective = {k: v for k, v in requested.items() if k not in ignored}
+            return IsolationReceipt(
+                label="synthetic", argv=("x",), exit_code=0, timed_out=False,
+                duration_ms=1.0, cwd="/box", home="/box/home", env_keys=(),
+                env_hash="h", dropped_env=(), sensitive_dropped=(),
+                rlimits_requested=requested, rlimits_effective=effective,
+                rlimits_ignored=ignored, source_fingerprint=None,
+                network_policy="none", backend="process",
+                enforcement={"rlimits": note}, stdout="", stderr="",
+            )
+
+        all_ok = make((), "measured-in-child: 4/4 enforced")
+        self.assertTrue(all(rlimit_disclosure(all_ok).values()))
+        some_ignored = make(("RLIMIT_AS",),
+                            "measured-in-child: 3/4 enforced; platform ignored: RLIMIT_AS")
+        self.assertTrue(all(rlimit_disclosure(some_ignored).values()))
+        # 反例：声称忽略了但实际没忽略 → 必须判红
+        lying = make((), "measured-in-child: 4/4 enforced; platform ignored: RLIMIT_AS")
+        self.assertFalse(rlimit_disclosure(lying)["note_matches_data"])
+        # 反例：漏报忽略项 → 必须判红
+        hiding = make(("RLIMIT_AS",), "measured-in-child: 4/4 enforced")
+        self.assertFalse(rlimit_disclosure(hiding)["note_matches_data"])
 
     def test_source_snapshot_is_read_only(self) -> None:
         rec = isolated_run(

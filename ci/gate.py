@@ -64,6 +64,7 @@ from michelin.verification.plan import load_plan  # noqa: E402
 from michelin.verification.rules import collect_files, find_ast_grep  # noqa: E402
 from michelin.runtime import (  # noqa: E402
     Budget, BudgetExceeded, BudgetGuard, Charge, RunHarness, SandboxPolicy, SpanLog,
+    rlimit_disclosure,
 )
 from pr_diff import export_tree, read_pr_diff  # noqa: E402
 from pr_fixture import ensure_demo_repo  # noqa: E402
@@ -540,6 +541,7 @@ class Gate:
             os.environ.pop(secret, None)
 
         child_env = json.loads(env_rec.stdout) if env_rec.ok else {}
+        disclosure = rlimit_disclosure(env_rec)
         checks = {
             "secret_not_in_child": secret not in child_env
             and "leak-value-42" not in env_rec.stdout,
@@ -551,9 +553,14 @@ class Gate:
             "source_fingerprint_recorded": bool(write_rec.source_fingerprint),
             "timeout_sigkill": slow_rec.timed_out and slow_rec.exit_code == -9
             and slow_rec.duration_ms < 3000,
-            "rlimits_measured_in_child": len(env_rec.rlimits_effective) >= 3,
-            "platform_gap_disclosed": bool(env_rec.rlimits_ignored)
-            and "platform ignored" in env_rec.enforcement["rlimits"],
+            # rlimit 的披露必须与实测严格一致，且至少有一项真的生效。
+            # **不预设平台一定会忽略某一项**：macOS 忽略 RLIMIT_AS，Linux 不忽略，
+            # 那是平台特性不是不变式（曾在这里硬断言「必须有一个被忽略」，
+            # 结果真实 CI（ubuntu）第一次跑就红了）。
+            "rlimits_measured_in_child": disclosure["measured_not_empty"],
+            "rlimits_at_least_one_enforced": disclosure["at_least_one_enforced"],
+            "rlimits_ignored_set_exact": disclosure["ignored_set_exact"],
+            "rlimit_note_matches_data": disclosure["note_matches_data"],
             "fs_boundary_not_overclaimed": env_rec.enforcement["filesystem_boundary"]
             .startswith("declared-only"),
             "network_boundary_not_overclaimed": env_rec.enforcement["network_boundary"]

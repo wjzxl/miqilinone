@@ -131,6 +131,25 @@ def push(repo: str, local_sha: str, remote_branch: str, identity: Path) -> str:
     return out.strip()
 
 
+def free_branch_name(repo: str, base_name: str) -> str:
+    """挑一个远端还不存在的分支名。
+
+    探针分支要从**新的 main** 派生（新旧 main 没有共同的新祖先），所以每次都
+    是新分支；同名会推不上去（non-fast-forward），因此自动加序号避开。
+    """
+    sys.path.insert(0, str(ROOT / "ci"))
+    from github_api_push import GitHub, resolve_token  # noqa: PLC0415
+
+    token, _ = resolve_token(repo.split("/", 1)[0])
+    gh = GitHub(token, repo)
+    index = 1
+    while True:
+        candidate = f"{base_name}-v{index}"
+        if gh.ref(candidate) is None:
+            return candidate
+        index += 1
+
+
 def open_pr_via_api(repo: str, head: str, base: str, title: str, body: str) -> dict:
     """用 GitHub API 开 PR（开 PR 不涉及 workflow 目录，API 通道可用）。"""
     sys.path.insert(0, str(ROOT / "ci"))
@@ -202,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
         # README/docs/工具改动一起算进来，「增量只扫 1 个文件」就演示不出来了。
         # 从新的 main 派生的分支与旧分支没有共同的新祖先，只能用新分支名 +
         # 新 PR（旧 PR 关闭），这样全程 fast-forward，不需要 force push。
-        pr_branch = f"{args.pr_branch}-v2"
+        pr_branch = free_branch_name(args.repo, args.pr_branch)
         pr_sha = build_commit(
             main_sha, args.local_ref, [],
             "test: PR 门禁增量路径探针（只改一个 .py，无规则违规）",

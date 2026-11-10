@@ -53,5 +53,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: michelin-gate-report
-          path: data/ci/gate-report.json
+          path: |
+            data/ci/gate-report.json
+            data/ci/unit-suite.log
           if-no-files-found: warn

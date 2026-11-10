@@ -236,14 +236,31 @@ class Gate:
 
     # ---- 1. 默认单测 ----
     def check_unit(self):
+        """跑默认单测。
+
+        完整输出落盘（data/ci/unit-suite.log，随 artifact 上传）——只留 600 字符
+        的尾巴会让 CI 变红时看不到真正的原因，必须能翻到完整现场。
+        """
         proc = subprocess.run(
             [sys.executable, "-m", "unittest", "discover", "-s", "tests"],
-            cwd=str(ROOT), capture_output=True, text=True, timeout=300,
+            cwd=str(ROOT), capture_output=True, text=True, timeout=600,
         )
+        combined = (proc.stdout or "") + (proc.stderr or "")
+        log_path = ROOT / "data" / "ci" / "unit-suite.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(combined, encoding="utf-8")
         tail = proc.stderr.strip()[-600:]
+        # 失败块比尾巴有用：从 FAIL:/ERROR: 开始截，完整收进证据。
+        failures: list[str] = []
+        lines = combined.splitlines()
+        for i, line in enumerate(lines):
+            if line.startswith(("FAIL: ", "ERROR: ")):
+                failures.append("\n".join(lines[i:i + 25]))
         return proc.returncode == 0, {
             "summary": tail.splitlines()[-1] if tail else "no output",
             "exit_code": proc.returncode, "stderr_tail": tail,
+            "failure_blocks": failures[:4],
+            "full_log": str(log_path.relative_to(ROOT)),
         }
 
     # ---- 2~5. 四条端到端流水线 ----

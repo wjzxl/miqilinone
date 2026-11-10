@@ -56,11 +56,13 @@ def _store(path: str, backend: str = "sqlite", dsn: str | None = None):
 def cmd_demo(args: argparse.Namespace) -> int:
     script, outcome, root_cause = SCENARIOS[args.scenario]
     store = _store(args.db, args.store, args.dsn)
-    worker_model, verifier_model = build_models(
+    pair = build_models(
         backend=args.backend, worker_script=script, verifier_script=["PASS"]
     )
+    worker_model, verifier_model = pair.worker, pair.verifier
     chief = ChiefOfStaff(
-        store, SourcePlane(store), worker_model, verifier_model, max_rework=args.max_rework
+        store, SourcePlane(store), worker_model, verifier_model,
+        max_rework=args.max_rework, waiver=pair.waiver,
     )
     intent = TaskIntent(
         intent="只读分析：归纳这批一手材料的关键结论，结论必须可追溯到 source_hash",
@@ -468,6 +470,129 @@ def cmd_p4_draft(args: argparse.Namespace) -> int:
     return 0 if not problems else 1
 
 
+def cmd_p6_live(args: argparse.Namespace) -> int:
+    """P6：用**真实模型**跑完整 P0 链路，产出可回放的证据链与真实用量。
+
+    与 `demo` 的区别：demo 用脚本化模型（确定性、无网络）；这里真的调用 provider，
+    所以 token 用量、耗时、成本都是真数字，也因此可能真的失败（裁决不通过、
+    预算熔断、网络错误）—— 失败就如实报失败，不粉饰。
+    """
+    import time
+
+    from .runtime import Budget, BudgetExceeded, BudgetGuard, Charge
+
+    pair = build_models(
+        backend=args.backend,
+        allow_same_family=True if args.allow_same_family else None,
+    )
+    worker_model, verifier_model = pair.worker, pair.verifier
+    if pair.waiver is None and worker_model.family == verifier_model.family:
+        print("错误: worker 与 verifier 同家族但没有豁免", file=sys.stderr)
+        return 3
+
+    work = Path(args.workdir) / f"live-{int(time.time())}"
+    work.mkdir(parents=True, exist_ok=True)
+    guard = BudgetGuard(
+        Budget(
+            max_actions=int(args.max_actions),
+            max_seconds=float(args.max_seconds),
+            max_external_requests=int(args.max_requests),
+            max_cost_usd=float(args.max_cost),
+        ),
+        work / "budget.jsonl",
+        run_id=f"p6-{int(time.time())}",
+    )
+
+    def charge(usage) -> None:
+        """每次真实调用都按真实 token 计费；超预算由守卫熔断（黏性）。"""
+        guard.check("llm-call", Charge(
+            actions=1,
+            external_requests=usage.external_requests,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+        ))
+
+    from .models import MeteredModel
+    worker_metered = MeteredModel(worker_model, charge)
+    verifier_metered = MeteredModel(verifier_model, charge)
+
+    store = _store(args.db, args.store, args.dsn)
+    chief = ChiefOfStaff(
+        store, SourcePlane(store), worker_metered, verifier_metered,
+        max_rework=args.max_rework, waiver=pair.waiver,
+    )
+
+    source_bodies = tuple(args.source or (
+        "【需求原文 1】把「模型自称完成」变成工程门禁：证据不足就不许派发。",
+        "【需求原文 2】出错时改环境规则而不是改提示词；每条规则都要证明它会开火。",
+    ))
+    intent = TaskIntent(
+        intent=args.intent,
+        source_bodies=source_bodies,
+        source_system="live-model",
+        risk_level="low",
+        budget=float(args.max_cost),
+    )
+
+    started = time.monotonic()
+    tripped: list[str] = []
+    try:
+        result = chief.handle(intent)
+    except BudgetExceeded as exc:
+        tripped.append(exc.reason)
+        print(f"预算熔断      : {exc.reason}", file=sys.stderr)
+        print(f"账本          : {work / 'budget.jsonl'}", file=sys.stderr)
+        return 4
+    elapsed = time.monotonic() - started
+
+    view = replay(store, result.run_id)
+    ledger = guard.replay()
+    worker_usage = worker_metered.total_usage
+    verifier_usage = verifier_metered.total_usage
+    total_in = worker_usage.input_tokens + verifier_usage.input_tokens
+    total_out = worker_usage.output_tokens + verifier_usage.output_tokens
+
+    print("=== 真实模型运行 ===")
+    print(f"worker 模型    : {worker_model.version}（家族 {worker_model.family}）")
+    print(f"verifier 模型  : {verifier_model.version}（家族 {verifier_model.family}）")
+    if pair.waiver:
+        print(f"独立性豁免     : ⚠️ 已降级并入链 —— {pair.waiver.reason}")
+        print(f"                 worker={pair.waiver.worker_model} / "
+              f"verifier={pair.waiver.verifier_model} 同属 {pair.waiver.verifier_family}")
+    else:
+        print("独立性         : worker 与 verifier 分属不同家族 ✅")
+    print(f"run_id         : {result.run_id}")
+    print(f"最终状态       : {result.state.value}")
+    print(f"裁决           : {result.verdict or '无（已升级人工）'}")
+    print(f"执行次数       : {result.attempts}（返工上限 {args.max_rework}）")
+    print(f"产物哈希       : {(result.artifact_hash or '')[:24]}")
+    print(f"耗时           : {elapsed:.1f}s")
+    print()
+    print("=== 真实用量（来自 provider 的 usage）===")
+    print(f"worker         : in={worker_usage.input_tokens} out={worker_usage.output_tokens} "
+          f"reasoning={worker_usage.reasoning_tokens} cached={worker_usage.cached_tokens}")
+    print(f"verifier       : in={verifier_usage.input_tokens} out={verifier_usage.output_tokens} "
+          f"reasoning={verifier_usage.reasoning_tokens} cached={verifier_usage.cached_tokens}")
+    print(f"合计           : in={total_in} out={total_out} "
+          f"≈${guard.budget.cost(total_in, total_out):.6f}")
+    print(f"预算账本       : actions={ledger['usage']['actions']} "
+          f"external_requests={ledger['usage']['external_requests']} "
+          f"cost=${ledger['usage']['cost_usd']:.6f} kill_switch={guard.kill_switch_engaged}")
+    print()
+    print(f"事件数         : {len(view.timeline)} | 哈希链 "
+          f"{'完好' if view.chain_ok else '损坏'} | 六锚点 "
+          f"{'齐全' if view.complete else '缺失'}")
+    print(f"回放命令       : python3 run.py replay --run-id {result.run_id}")
+    print(f"预算账本       : {work / 'budget.jsonl'}")
+
+    artifact = ""
+    for event in view.timeline:
+        if event.get("type") == "artifact.produced":
+            artifact = str(event.get("payload", {}).get("artifact_hash", ""))
+    print("\n提示：产物正文在事件链里（artifact.produced 只记哈希，明文在 agent_run/artifact 表中）。")
+    return 0 if (view.complete and view.chain_ok and result.state.value == "ACCEPTED") else 1
+
+
 def cmd_p5_runtime(args: argparse.Namespace) -> int:
     """P5：本地跑一次「预算 → 隔离 → 观测」演示，产出 runtime-report.json。"""
     import json
@@ -625,6 +750,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_p5.add_argument("--trip", action="store_true",
                        help="额外请求动作，演示黏性 kill switch")
     p_p5.set_defaults(func=cmd_p5_runtime)
+
+    p_p6 = sub.add_parser(
+        "p6-live", help="P6：用真实模型（DeepSeek 等）跑完整链路，真实 token 用量与成本入账")
+    p_p6.add_argument("--backend", default=os.getenv("MW_MODEL_BACKEND", "deepseek"),
+                      help="scripted | openai_compat | deepseek")
+    p_p6.add_argument("--intent", default=(
+        "只读分析：归纳这批一手材料的关键结论，结论必须可追溯到 source_hash，"
+        "并在正文里给出 EVIDENCE:ok 标记与依据引用"))
+    p_p6.add_argument("--source", action="append",
+                      help="一手原文，可重复传入；不给则用内置示例")
+    p_p6.add_argument("--workdir", default=str(PROJECT_ROOT / "data" / "p6-runs"))
+    p_p6.add_argument("--max-rework", type=int, default=1)
+    p_p6.add_argument("--max-actions", type=int, default=20)
+    p_p6.add_argument("--max-seconds", type=float, default=300.0)
+    p_p6.add_argument("--max-requests", type=int, default=20)
+    p_p6.add_argument("--max-cost", type=float, default=0.5)
+    p_p6.add_argument("--allow-same-family", action="store_true",
+                      help="显式接受 worker/verifier 同属一个模型家族（豁免会写进证据链）")
+    p_p6.set_defaults(func=cmd_p6_live)
     return parser
 
 

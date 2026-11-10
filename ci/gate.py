@@ -166,13 +166,14 @@ class Gate:
                 "error": f"{type(exc).__name__}: {exc}",
                 "traceback": traceback.format_exc()[-800:],
             }
+        skipped = bool(isinstance(evidence, dict) and evidence.get("skipped"))
         entry = {
-            "name": name, "ok": bool(ok),
+            "name": name, "ok": bool(ok), "skipped": skipped,
             "seconds": round(time.monotonic() - started, 2),
             "evidence": _jsonable(evidence),
         }
         self.checks.append(entry)
-        flag = "PASS" if ok else "FAIL"
+        flag = "SKIP" if skipped else ("PASS" if ok else "FAIL")
         detail = evidence.get("summary", "") if isinstance(evidence, dict) else ""
         print(f"[{flag}] {name:<22} {entry['seconds']:>6.2f}s  {detail}", flush=True)
         if not ok and isinstance(evidence, dict):
@@ -679,6 +680,71 @@ class Gate:
             "semconv_version": SEMCONV_VERSION,
         }
 
+    def check_real_model(self):
+        """P6：真实模型冒烟。没有配置密钥就**跳过**（CI 不依赖密钥与外网）。
+
+        跳过不是「通过」：报告会单独列出 skipped 项，让人一眼看出这项没被验过。
+        """
+        import os
+
+        from michelin.models import OpenAICompatModel, resolve_api_key
+
+        base = os.getenv("MW_API_BASE", "https://api.deepseek.com/v1")
+        try:
+            resolve_api_key(base)
+        except RuntimeError as exc:
+            return True, {
+                "skipped": True,
+                "reason": str(exc),
+                "summary": "未配置模型密钥 → 跳过真实模型冒烟（CI 不依赖密钥）",
+            }
+        model = OpenAICompatModel(
+            os.getenv("MW_WORKER_MODEL", "deepseek-flash"), api_base=base, max_tokens=32
+        )
+        response = model.complete("只回答一个词：OK")
+        ok = bool(response.text.strip()) and response.usage.total_tokens > 0
+        return ok, {
+            "summary": (f"{model.version} 调用成功：{response.usage.total_tokens} tokens "
+                        f"(in={response.usage.input_tokens} out={response.usage.output_tokens} "
+                        f"reasoning={response.usage.reasoning_tokens}) "
+                        f"request_id={response.provider_request_id[:12]}"),
+            "model": model.version,
+            "usage": response.usage.to_dict(),
+            "provider_request_id": response.provider_request_id,
+            "text_preview": response.text[:80],
+        }
+
+    def check_no_secret_in_repo(self):
+        """P6：仓库里不能出现任何密钥字面量（真实模型接入后的必检项）。"""
+        import re
+
+        patterns = {
+            "openai/deepseek style": re.compile(r"sk-[A-Za-z0-9]{20,}"),
+            "github classic PAT": re.compile(r"ghp_[A-Za-z0-9]{20,}"),
+            "private key block": re.compile(r"BEGIN (RSA |OPENSSH |EC )?PRIVATE KEY"),
+        }
+        tracked = subprocess.run(
+            ["git", "-C", str(ROOT), "-c", "core.quotepath=false", "ls-files"],
+            capture_output=True, text=True,
+        ).stdout.splitlines()
+        offenders: list[dict] = []
+        for rel in tracked:
+            path = ROOT / rel
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for label, pattern in patterns.items():
+                if pattern.search(text):
+                    offenders.append({"file": rel, "pattern": label})
+                    break
+        return not offenders, {
+            "summary": (f"扫描 {len(tracked)} 个受版本控制的文件，"
+                        f"{len(offenders)} 处疑似密钥"),
+            "scanned": len(tracked),
+            "offenders": offenders,
+        }
+
     def run(self) -> dict:
         started = datetime.now(timezone.utc).isoformat()
         print(f"P5 CI gate | root={ROOT} | fast={self.fast}")
@@ -696,8 +762,11 @@ class Gate:
         self._check("pr_diff_gate", self.check_pr_diff)
         self._check("runtime_isolation", self.check_runtime_isolation)
         self._check("telemetry_budget", self.check_telemetry_budget)
+        self._check("no_secret_in_repo", self.check_no_secret_in_repo)
+        self._check("real_model_smoke", self.check_real_model)
 
         failed = [c["name"] for c in self.checks if not c["ok"]]
+        skipped = [c["name"] for c in self.checks if c.get("skipped")]
         report = {
             "gate": "michelin-p5-ci",
             "started_at": started,
@@ -710,8 +779,9 @@ class Gate:
             "checks": self.checks,
             "summary": {
                 "total": len(self.checks),
-                "passed": len(self.checks) - len(failed),
+                "passed": len(self.checks) - len(failed) - len(skipped),
                 "failed": failed,
+                "skipped": skipped,
                 "ok": not failed,
             },
             "report_hash_input": content_hash({
@@ -720,6 +790,7 @@ class Gate:
         }
         print(f"\n{'GATE GREEN' if not failed else 'GATE RED'}: "
               f"{report['summary']['passed']}/{report['summary']['total']} 项通过"
+              + (f"，跳过：{', '.join(skipped)}" if skipped else "")
               + (f"，失败：{', '.join(failed)}" if failed else ""))
         return report
 

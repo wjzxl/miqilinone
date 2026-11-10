@@ -5,9 +5,10 @@
 > 调度、执行、裁决三权分离；每一次交付都带一条 append-only 哈希证据链，
 > 门禁未证明就不得派发。
 
-本仓库是一个**可运行**的工程骨架（P0–P5），不是设计稿：13 项 CI 门禁已在
-**真实的 GitHub Actions** 上跑通（push 与 pull_request 两个 run 均 13/13 通过，
-`gate-report.json` artifact 可下载复核）。
+本仓库是一个**可运行**的工程骨架（P0–P6），不是设计稿：门禁在
+**真实的 GitHub Actions** 上跑通过（push 与 pull_request 两个 run 均成功，
+`gate-report.json` artifact 可下载复核）；接入真实模型后门禁扩到 **15 项**
+（新增仓库密钥扫描与真实模型冒烟，后者无密钥时自动跳过）。
 
 ---
 
@@ -62,7 +63,7 @@ src/michelin/
   runtime/       进程级隔离、span 哈希链、预算与 kill switch
   guardrails/    结构化规则
 ci/
-  gate.py        **唯一门禁入口**（13 项检查，产出 gate-report.json）
+  gate.py        **唯一门禁入口**（15 项检查，产出 gate-report.json）
   pr_diff.py     真实 git 三方 diff（A/M/R/C/D/T、NUL 安全）
   pr_fixture.py  可复现的 PR 靶场
   github_api_push.py  Git Data API 推送（git push 被代理拦死时的通道）
@@ -87,20 +88,43 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[astgrep]"
 .venv/bin/python run.py p5-runtime --trip             # 演示预算熔断与 kill switch
 ```
 
+### 真实模型（DeepSeek）
+
+```bash
+# 密钥只放本机文件（600 权限），绝不进仓库
+mkdir -p ~/.config/michelin && chmod 700 ~/.config/michelin
+printf '%s' 'sk-...' > ~/.config/michelin/deepseek_api_key && chmod 600 ~/.config/michelin/deepseek_api_key
+
+python3 run.py p6-live --backend deepseek --allow-same-family
+```
+
+真实调用 DeepSeek（`deepseek-flash` 做 worker、`deepseek-v4-pro` 做 verifier），
+输出真实 token 用量、耗时与成本，并把这些数字记进证据链。门禁里的
+`real_model_smoke` 会在有密钥时做一次真实冒烟，**没有密钥就跳过**（CI 不依赖密钥）。
+
+**关于模型家族独立性**：`deepseek-flash` 与 `deepseek-v4-pro` 同属
+`open-source-cn` 家族，默认会被 holdout 护栏拒绝。放行要显式声明
+（`--allow-same-family` 或 `MW_ALLOW_SAME_MODEL_FAMILY=1`），而且这份豁免
+**会被写进证据链**：事件流里有一条 `model.independence_waived`，verdict 里也有
+`model_independence_waived` 检查项。降级可见，不静默。
+
 `p1-webhook`（验签/去重/DLQ）、`p1-durable`（DBOS 持久工作流与崩溃恢复）、
 `p1-status` 需要 Postgres 或 DBOS 环境，未装时相关检查会按环境 skip。
 
 ### 门禁
 
 ```bash
-python3 ci/gate.py --report data/ci/gate-report.json   # 13 项检查，唯一入口
+python3 ci/gate.py --report data/ci/gate-report.json   # 15 项检查，唯一入口
 python3 ci/gate.py --fast                               # 快速版
 ```
 
-13 项分别是：单测、自举验证、异构外部仓库、换 ast-grep 主后端、自动起草、
+15 项分别是：单测、自举验证、异构外部仓库、换 ast-grep 主后端、自动起草、
 无应用知识污染、**生成的 YAML 规则交给真正的 ast-grep CLI 扫**、
 PR 增量规则扫描、负向阻断、head_sha 敏感性、**真实 git PR diff**、
-运行时隔离证据、埋点与预算熔断。
+运行时隔离证据、埋点与预算熔断、**仓库密钥扫描**、**真实模型冒烟**。
+
+最后一项在没有配置密钥时**标记为 SKIP 而不是 PASS** —— 报告的 `summary.skipped`
+会单独列出，让人一眼看出这项没被验过。
 
 ### 复现 CI
 
@@ -186,11 +210,13 @@ base_line clean=True  →  逐条注入变异  →  4/4 条规则命中
 
 诚实列出，避免被误当成已完成：
 
-- 真实模型接入、真实 MCP 网关（当前是接口与替身）。
-- 每任务的容器级隔离与网络策略（当前只有进程级 + `declared-only` 声明）。
+- 每任务的容器级隔离与网络策略（当前只有进程级 + `declared-only` 声明，
+  需换 gVisor / Kata 后端）。
 - 规则后端只支持 Python 的三种 kind；PR 增量扫描只吃 `.py`。
 - OTel 只落地了哈希链 span 与 GenAI 属性，尚未接具体可观测平台。
 - 夜间 cron、fan-out、durable queue 并发限流未接。
+- MCP 网关尚未接入；模型侧目前只做了 DeepSeek 与通用 OpenAI 兼容端点。
+- 真实模型目前只接在 P0 只读链路（P6）；P2/P3 的 git 任务仍是脚本化模型。
 
 ## 11. 许可
 

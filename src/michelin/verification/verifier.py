@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 from ..chief.policy import EvidenceSpec
-from ..models import ModelAdapter
+from ..models import IndependenceWaiver, ModelAdapter
 from ..platform.envelope import SEMCONV_VERSION, make_envelope, new_id, utcnow
 from ..platform.store import EventStore
 from .holdout import HoldoutBundle, HoldoutViolation, assert_holdout_shape
@@ -104,13 +104,14 @@ class IndependentVerifier:
         head_sha: str,
         evidence_spec: EvidenceSpec,
         source_hashes: tuple[str, ...] = (),
+        independence_waiver: IndependenceWaiver | None = None,
     ) -> Verdict:
         """唯一位置参数就是 holdout 结构体；其余全为 keyword-only 元数据。
 
         tests/test_holdout.py 用 AST 锁住这个签名：不允许新增任何作者侧叙述参数。
         """
         assert_holdout_shape(bundle)
-        if self.model.family == author_family:
+        if self.model.family == author_family and independence_waiver is None:
             raise HoldoutViolation(
                 f"verifier 与作者同属 {author_family} 模型家族，裁决无效"
             )
@@ -136,9 +137,19 @@ class IndependentVerifier:
              "detail": f"{sum(m['fired'] for m in mutations)}/{len(mutations)} 条门禁在破坏变体上开火"},
             {"name": "llm_judge_opinion", "kind": "advisory", "passed": True,
              "detail": f"{self.model.version}: {judge.text[:120]}"},
+            {"name": "llm_judge_usage", "kind": "meta", "passed": True,
+             "detail": f"judge 用量 {judge.usage.to_dict()}"},
             {"name": "self_report_discarded", "kind": "meta", "passed": True,
              "detail": f"已丢弃自陈: {report.self_reported_test_output[:100]}"},
         ]
+        if independence_waiver is not None:
+            # 降级必须出现在裁决记录里，不能只存在于某个人的脑子里。
+            checks.append({
+                "name": "model_independence_waived", "kind": "meta", "passed": True,
+                "detail": (f"家族级独立性已豁免：verifier({independence_waiver.verifier_model}) "
+                           f"与 author({independence_waiver.worker_model}) 同属 "
+                           f"{independence_waiver.verifier_family}；{independence_waiver.reason}"),
+            })
         result = "PASS" if (report.passed and all_gates_fired) else "FAIL"
 
         verdict = Verdict(
@@ -183,6 +194,11 @@ class IndependentVerifier:
                 "self_reported_test_output": report.self_reported_test_output,
                 "author_family": author_family,
                 "verifier_family": self.model.family,
+                "independence_waiver": (
+                    independence_waiver.to_dict() if independence_waiver else None
+                ),
+                "judge_usage": judge.usage.to_dict(),
+                "provider_request_id": judge.provider_request_id,
                 "mutations": mutations,
             },
         )

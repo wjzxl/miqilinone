@@ -17,7 +17,7 @@ from ..chief.policy import (
 )
 from ..context.sources import SourcePlane
 from ..delivery.sampler import Sampler
-from ..models import ModelAdapter
+from ..models import IndependenceWaiver, ModelAdapter
 from ..platform.envelope import SEMCONV_VERSION, content_hash, make_envelope, new_id, utcnow
 from ..platform.store import EventStore
 from ..verification.holdout import build_holdout
@@ -57,14 +57,19 @@ class ChiefOfStaff:
         verifier_model: ModelAdapter,
         *,
         max_rework: int = 2,
+        waiver: IndependenceWaiver | None = None,
     ):
-        if worker_model.family == verifier_model.family:
-            raise RuntimeError("worker 与 verifier 必须分属不同模型家族")
+        if worker_model.family == verifier_model.family and waiver is None:
+            raise RuntimeError(
+                "worker 与 verifier 必须分属不同模型家族"
+                "（确需同家族请显式声明豁免，豁免会被写进证据链）"
+            )
         self.store = store
         self.source_plane = source_plane
         self.worker_model = worker_model
         self.verifier = IndependentVerifier(store, verifier_model)
         self.max_rework = max_rework
+        self.waiver = waiver
 
     # ---------- 内部工具 ----------
     def _emit(self, run_id: str, task_id: str, event_type: str, payload: dict, **env_fields: object) -> int:
@@ -130,6 +135,12 @@ class ChiefOfStaff:
             "risk_level": intent.risk_level,
             "budget": intent.budget,
         })
+        if self.waiver is not None:
+            # 独立性降级必须第一时间入链：谁在什么时候、用什么理由降级，一目了然。
+            self._emit(run_id, task_id, "model.independence_waived", {
+                **self.waiver.to_dict(),
+                "note": "本次裁决没有跨模型家族独立性；结构性 holdout（输入隔离）仍然成立",
+            })
 
         # L0 → L1：一手原文入库，worker 拿原文 + hash，不是摘要。
         docs = [
@@ -208,6 +219,9 @@ class ChiefOfStaff:
                     "model_family": output.model_response.model_family,
                     "model_version": output.model_response.model_version,
                     "prompt_hash": output.model_response.prompt_hash,
+                    "usage": output.model_response.usage.to_dict(),
+                    "provider_request_id": output.model_response.provider_request_id,
+                    "finish_reason": output.model_response.finish_reason,
                     "tool_calls": list(output.tool_calls),
                     "self_check_output": output.self_check_output,
                 },
@@ -245,6 +259,7 @@ class ChiefOfStaff:
                 head_sha=artifact_hash,
                 evidence_spec=spec,
                 source_hashes=source_hashes,
+                independence_waiver=self.waiver,
             )
             verdict_result = verdict.result
             new_state = TaskState.VERDICT_PASS if verdict.result == "PASS" else TaskState.VERDICT_FAIL

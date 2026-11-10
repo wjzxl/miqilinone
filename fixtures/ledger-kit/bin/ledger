@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""ledger-kit 的用户入口：无 .py 后缀，刻意区别于 Python 包内模块。"""
+
+from ledgerkit.cli import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())

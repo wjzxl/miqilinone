@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "michelin-workbench"
+version = "0.1.0"
+description = "AI 米其林智能工作台：append-only 证据链 + 总厨调度 + holdout 独立验证 + 可配置仓库验证门禁"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+# P1 依赖：本机已用 .venv 安装 psycopg 3.3.8 + dbos 3.4.0（MIT）
+# P0 路径一条都不需要，系统 python3 可直接跑
+postgres = ["psycopg[binary]>=3.2", "dbos>=3.4"]
+# P3 可选：装了就自动升级成「python-ast + ast-grep」双后端对拍；不装完全可用。
+# ast-grep-cli 提供 `ast-grep` 命令；`sg` 是 deprecated 别名，不要用。
+astgrep = ["ast-grep-cli>=0.51"]
+
+[project.scripts]
+michelin = "michelin.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

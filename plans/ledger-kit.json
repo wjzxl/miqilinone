@@ -1,0 +1,113 @@
+{
+  "app_name": "ledger-kit",
+  "surface": "flat-layout Python package + bin/ledger CLI, 测试目录是 spec/ 而非 tests/",
+  "language": "python",
+  "launch": {
+    "argv": ["python3", "-c", "print('LEDGER_READY', __import__('ledgerkit').__version__)"],
+    "expect_stdout_contains": "LEDGER_READY",
+    "expect_exit_code": 0,
+    "timeout_seconds": 30
+  },
+  "doctor": {
+    "argv": ["python3", "-c", "print('DOCTOR_READY' if __import__('pathlib').Path('config/settings.json').is_file() and __import__('pathlib').Path('spec').is_dir() else 'DOCTOR_FAIL')"],
+    "expect_stdout_contains": "DOCTOR_READY",
+    "expect_exit_code": 0,
+    "timeout_seconds": 30
+  },
+  "journeys": [
+    {
+      "name": "unit-suite",
+      "argv": ["python3", "-m", "unittest", "discover", "-s", "spec", "-p", "test_*.py", "-v"],
+      "expect_stdout_contains": "OK",
+      "expect_exit_code": 0,
+      "timeout_seconds": 60
+    },
+    {
+      "name": "cli-total",
+      "argv": ["python3", "bin/ledger", "total", "3", "7"],
+      "expect_stdout_contains": "TOTAL=10",
+      "expect_exit_code": 0,
+      "timeout_seconds": 30
+    }
+  ],
+  "rules": [
+    {
+      "id": "no-pickle-loads",
+      "kind": "forbidden_call",
+      "selector": "pickle.loads",
+      "message": "数据交换只用 JSON；禁止 pickle 反序列化",
+      "globs": ["ledgerkit/**/*.py", "spec/**/*.py"],
+      "severity": "error"
+    },
+    {
+      "id": "no-shell-out",
+      "kind": "forbidden_call",
+      "selector": "subprocess.getoutput",
+      "message": "外部命令必须显式 argv，禁止拼 shell 的 getoutput",
+      "globs": ["ledgerkit/**/*.py", "spec/**/*.py"],
+      "severity": "error"
+    },
+    {
+      "id": "no-yaml-import",
+      "kind": "forbidden_import",
+      "selector": "yaml",
+      "message": "配置只用 JSON；不得引入第三方 YAML 解析",
+      "globs": ["ledgerkit/**/*.py", "spec/**/*.py"],
+      "severity": "error"
+    },
+    {
+      "id": "no-debug-flag",
+      "kind": "forbidden_literal",
+      "selector": "DEBUG",
+      "literal": "True",
+      "message": "DEBUG 不得以字面量 True 提交",
+      "globs": ["ledgerkit/**/*.py", "spec/**/*.py"],
+      "severity": "error"
+    }
+  ],
+  "mutations": [
+    {
+      "rule_id": "no-pickle-loads",
+      "inject_file": "spec/fixtures_target.py",
+      "snippet": "def _mutant_pickle():\n    import pickle\n    return pickle.loads(b'')"
+    },
+    {
+      "rule_id": "no-shell-out",
+      "inject_file": "spec/fixtures_target.py",
+      "snippet": "def _mutant_shell():\n    import subprocess\n    return subprocess.getoutput('echo hi')"
+    },
+    {
+      "rule_id": "no-yaml-import",
+      "inject_file": "spec/fixtures_target.py",
+      "snippet": "def _mutant_yaml():\n    import yaml\n    return yaml"
+    },
+    {
+      "rule_id": "no-debug-flag",
+      "inject_file": "spec/fixtures_target.py",
+      "snippet": "def _mutant_debug():\n    DEBUG = True\n    return DEBUG"
+    }
+  ],
+  "features": [
+    {
+      "name": "flat-package-surface",
+      "sub_features": "- 根目录可直接导入的 ledgerkit 包（无 src layout）\n- 无 .py 后缀的 bin/ledger 用户入口",
+      "user_pov": "在仓库根执行 `python3 bin/ledger total 3 7`，看到 `TOTAL=10`；改 core.py 的计算逻辑会让这条旅程变红。",
+      "driving": "plan 的 cli-total journey 直接执行上述命令并断言 stdout 含 TOTAL=10；unit-suite journey 跑 `unittest discover -s spec -p test_*.py -v`。两段完整输出落到 evidence/journey-*.log。",
+      "gotchas": "helper 会把 APP_ROOT 加进 PYTHONPATH，所以 bin/ledger 才能 import 根包；不要把这条旅程换成 import 内部函数，那不是用户路径。"
+    },
+    {
+      "name": "governed-data-boundary",
+      "sub_features": "- 四条结构化规则：pickle.loads / subprocess.getoutput / yaml / DEBUG=True\n- python-ast 与 ast-grep 双后端对拍 + 每条规则的变异证明",
+      "user_pov": "往 spec/ 下任何 Python 文件里塞一个 pickle.loads 调用，Drive 段立刻 DRIVE_FAIL 并打印规则 id、文件与行号。",
+      "driving": "生成的 helper 内嵌 python-ast 检查器；rules/*.yml 是同一组规则的 ast-grep 版本，可直接在 CI 里执行。变异注入到 spec/fixtures_target.py（不匹配 test_*.py，不会被 journey 导入）。",
+      "gotchas": "globs 必须覆盖 ledgerkit/ 与 spec/；变异只在 ShadowRepo 副本里追加，绝不写回 ledger-kit 本体。两个后端判定不一致时阻断，不靠人工放行。"
+    }
+  ],
+  "evidence_path": "evidence/proof.json（run 目录内，cleanup 后必须存活）",
+  "isolate_note": "VERIFY_APP_ROOT 指向 ledger-kit；VERIFY_RUN_DIR 按 run 独占；ShadowRepo 是一次性副本",
+  "notes": [
+    "本计划与主体工程的自举计划在命令、目录、规则、变异靶子上完全不同，用于证明生成物不含目标应用知识",
+    "给一手信息，不给二手摘要：plan.json 是生成物的唯一事实来源",
+    "verdict 绑定 repo_fingerprint + plan_fingerprint + skill_hash，任一变化都要重裁"
+  ]
+}

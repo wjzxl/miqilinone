@@ -1,0 +1,29 @@
+# P1 的持久化脊。P0 默认零外部依赖，直接 `python3 run.py demo` 即可。
+#
+# 实机状态（2026-11-09）：本地已有 pgvector/pgvector:pg16 镜像，
+# 已启动独立容器 michelin-p1-pg，映射 127.0.0.1:55432（避开用户已有的 5434 端口）。
+# 复用：docker start michelin-p1-pg  /  重建：docker compose up -d postgres
+#
+# - EventStoreProtocol 是适配器契约，PostgresEventStore 与 SQLite EventStore 同签名，上层不动
+# - pgvector 已启用（0.8.6），但向量只用于检索排序，绝不进 worker 上下文
+# - DBOS 3.4.0 的 @DBOS.step 检查点 + recv/send 审批门，系统表建在同一个库
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: michelin-postgres
+    environment:
+      POSTGRES_USER: michelin
+      POSTGRES_PASSWORD: michelin
+      POSTGRES_DB: michelin
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U michelin -d michelin"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

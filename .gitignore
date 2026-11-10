@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/objects/
+.pytest_cache/
+*.egg-info/
+
+# P2/P3/P4 运行产物：CI 会上传 gate-report artifact，本地产物不入库
+data/p2-runs/
+data/p3-runs/
+data/ci/runs/
+data/ci/pr-repos/
+data/ci/gate-report*.json
+data/p4-drafts/
+data/p5-runs/
+data/external-repos/

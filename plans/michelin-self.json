@@ -1,0 +1,113 @@
+{
+  "app_name": "michelin-workbench",
+  "surface": "Python library + CLI (run.py), 以 unittest 为用户入口",
+  "language": "python",
+  "launch": {
+    "argv": ["python3", "-c", "import pathlib,sys; ok=pathlib.Path('src/michelin/__init__.py').is_file(); print('REPO_READY' if ok else 'REPO_MISSING'); sys.exit(0 if ok else 1)"],
+    "expect_stdout_contains": "REPO_READY",
+    "expect_exit_code": 0,
+    "timeout_seconds": 30
+  },
+  "doctor": {
+    "argv": ["python3", "-c", "import pathlib,sys; ok=all(pathlib.Path(p).is_dir() for p in ('src/michelin/verification','tests')); print('DOCTOR_READY' if ok else 'DOCTOR_FAIL'); sys.exit(0 if ok else 1)"],
+    "expect_stdout_contains": "DOCTOR_READY",
+    "expect_exit_code": 0,
+    "timeout_seconds": 30
+  },
+  "journeys": [
+    {
+      "name": "holdout-contract",
+      "argv": ["python3", "-m", "unittest", "discover", "-s", "tests", "-p", "test_holdout.py", "-v"],
+      "expect_stdout_contains": "",
+      "expect_exit_code": 0,
+      "timeout_seconds": 90
+    },
+    {
+      "name": "plan-import",
+      "argv": ["python3", "-c", "import sys; sys.path.insert(0,'src'); from michelin.verification.plan import RULE_KINDS; print('PLAN_OK', len(RULE_KINDS))"],
+      "expect_stdout_contains": "PLAN_OK",
+      "expect_exit_code": 0,
+      "timeout_seconds": 30
+    }
+  ],
+  "rules": [
+    {
+      "id": "no-eval-in-spine",
+      "kind": "forbidden_call",
+      "selector": "eval",
+      "message": "事件脊与验证层禁止动态求值：证据链必须可静态审计",
+      "globs": ["src/michelin/**/*.py", "tests/**/*.py"],
+      "severity": "error"
+    },
+    {
+      "id": "no-shell-out",
+      "kind": "forbidden_call",
+      "selector": "os.system",
+      "message": "禁止 os.system；外部命令必须走显式 argv 且受 tool_policy 约束",
+      "globs": ["src/michelin/**/*.py", "tests/**/*.py"],
+      "severity": "error"
+    },
+    {
+      "id": "no-http-client-import",
+      "kind": "forbidden_import",
+      "selector": "requests",
+      "message": "验证层不得引入 HTTP 客户端；出站能力只能经 MCP/网关显式授权",
+      "globs": ["src/michelin/**/*.py", "tests/**/*.py"],
+      "severity": "error"
+    },
+    {
+      "id": "no-placeholder-rate",
+      "kind": "forbidden_literal",
+      "selector": "TAX_RATE",
+      "literal": "0.10",
+      "message": "禁止把演示用的错误税率作为模块级常量带回生产代码",
+      "globs": ["src/michelin/**/*.py", "tests/**/*.py"],
+      "severity": "error"
+    }
+  ],
+  "mutations": [
+    {
+      "rule_id": "no-eval-in-spine",
+      "inject_file": "tests/test_p3_rules.py",
+      "snippet": "def _mw_mutant_eval():\n    return eval('1 + 1')"
+    },
+    {
+      "rule_id": "no-shell-out",
+      "inject_file": "tests/test_p3_rules.py",
+      "snippet": "import os\ndef _mw_mutant_shell():\n    return os.system('true')"
+    },
+    {
+      "rule_id": "no-http-client-import",
+      "inject_file": "tests/test_p3_rules.py",
+      "snippet": "import requests\ndef _mw_mutant_net():\n    return requests.get('https://example.invalid')"
+    },
+    {
+      "rule_id": "no-placeholder-rate",
+      "inject_file": "tests/test_p3_rules.py",
+      "snippet": "TAX_RATE = 0.10"
+    }
+  ],
+  "features": [
+    {
+      "name": "holdout-signature-lock",
+      "sub_features": "- HoldoutBundle 的 frozen + slots 字段集合\n- build_holdout 与 verify() 的签名锁",
+      "user_pov": "在项目根执行 `python3 -m unittest tests.test_holdout -v`，看到全部通过；任何往 holdout 里塞 plan/transcript 的改动都会让测试变红。",
+      "driving": "plan 的 holdout-contract journey 直接执行上面的 unittest 命令，退出码 0 才算通过；Drive 同时把完整 stdout/stderr 落到 evidence/journey-*.log。",
+      "gotchas": "不要为了让测试通过而放宽 AST 断言的字段集合。若确需新增字段，必须同步改测试并在治理文档里说明「为什么这个字段不会泄漏作者自陈」。"
+    },
+    {
+      "name": "structured-rule-gate",
+      "sub_features": "- 四类结构化规则（动态求值 / shell 外调 / HTTP 客户端 / 演示常量）\n- python-ast 与 ast-grep 双后端对拍",
+      "user_pov": "Drive 段执行完旅程后扫描整个代码库，任何一条规则命中都会立刻 `DRIVE_FAIL` 并打印规则 id、文件与行号。",
+      "driving": "生成的 helper 内嵌 python-ast 检查器；`rules/*.yml` 是同一组规则的 ast-grep 版本。每条规则都必须经「注入违规代码 → 规则命中 → Drive 拒绝」的变异证明。",
+      "gotchas": "规则 globs 必须同时覆盖 src 与 tests；变异只能写在 ShadowRepo 副本里，绝不写回真实仓库。两个后端判定不一致时直接阻断，不靠「差不多」放行。"
+    }
+  ],
+  "evidence_path": "evidence/proof.json（run 目录内，cleanup 后必须存活）",
+  "isolate_note": "VERIFY_DATA_DIR 按 run 独占；ShadowRepo 是仓库的一次性副本，变异不污染真实仓库",
+  "notes": [
+    "给一手信息，不给二手摘要：plan.json 是生成物的唯一事实来源",
+    "出错改环境规则（rules/*.yml 与 plan.rules），不改提示词",
+    "verdict 绑定 repo_fingerprint + plan_fingerprint + skill_hash，任一变化都要重裁"
+  ]
+}

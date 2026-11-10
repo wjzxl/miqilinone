@@ -470,6 +470,125 @@ def cmd_p4_draft(args: argparse.Namespace) -> int:
     return 0 if not problems else 1
 
 
+def cmd_p6_live_git(args: argparse.Namespace) -> int:
+    """P6-git：**真实模型**在真实 git worktree 里改代码，由独立 verifier 重放裁决。
+
+    与 `p6-live`（只读分析）的区别：这里 worker 真的改文件、产出 unified diff；
+    verifier 在**另一个干净 worktree** 上 `git apply` 作者的 diff，再驱动真实
+    CLI（六段式 skill）判定。模型的自述被整个丢弃。
+    """
+    import time
+
+    from .chief.p2_workflow import P2Pipeline, P2Scenario
+    from .models import MeteredModel
+    from .runtime import Budget, BudgetExceeded, BudgetGuard, Charge
+
+    pair = build_models(
+        backend=args.backend,
+        allow_same_family=True if args.allow_same_family else None,
+    )
+    worker_model, verifier_model = pair.worker, pair.verifier
+    if pair.waiver is None and worker_model.family == verifier_model.family:
+        print("错误: worker 与 verifier 同家族但没有豁免", file=sys.stderr)
+        return 3
+
+    work = Path(args.workdir)
+    work.mkdir(parents=True, exist_ok=True)
+    guard = BudgetGuard(
+        Budget(
+            max_actions=int(args.max_actions),
+            max_seconds=float(args.max_seconds),
+            max_external_requests=int(args.max_requests),
+            max_cost_usd=float(args.max_cost),
+        ),
+        work / f"budget-{int(time.time())}.jsonl",
+        run_id=f"p6-git-{int(time.time())}",
+    )
+
+    def charge(usage) -> None:
+        guard.check("llm-call", Charge(
+            actions=1, external_requests=usage.external_requests,
+            input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
+        ))
+
+    worker_metered = MeteredModel(worker_model, charge)
+    verifier_metered = MeteredModel(verifier_model, charge)
+
+    store = _store(args.db, args.store, args.dsn)
+    pipeline = P2Pipeline(
+        store, SourcePlane(store), worker_metered, verifier_metered,
+        work / "runs", max_rework=args.max_rework, waiver=pair.waiver,
+    )
+    scenario = P2Scenario(
+        worker_rates=("0.06",),
+        sampling_outcome=args.sampling_outcome,
+        sampling_root_cause=args.sampling_root_cause,
+    )
+    intent = TaskIntent(
+        intent=args.intent,
+        source_bodies=(
+            "【需求原文】税率应为 6%，金额保留两位小数；验收必须驱动真实 CLI，不许读源码断言。",
+            "【治理原文】每条门禁都要有故意破坏的变体证明它会开火；cleanup 不得删除证据。",
+        ),
+        source_system="live-model-git",
+    )
+
+    started = time.monotonic()
+    try:
+        result = pipeline.handle(intent, scenario)
+    except BudgetExceeded as exc:
+        print(f"预算熔断      : {exc.reason}", file=sys.stderr)
+        return 4
+    elapsed = time.monotonic() - started
+
+    view = replay(store, result.run_id)
+    ledger = guard.replay()
+    worker_usage = worker_metered.total_usage
+    verifier_usage = verifier_metered.total_usage
+    total_in = worker_usage.input_tokens + verifier_usage.input_tokens
+    total_out = worker_usage.output_tokens + verifier_usage.output_tokens
+
+    print("=== 真实模型 · 真实改代码 ===")
+    print(f"worker 模型    : {worker_model.version}（家族 {worker_model.family}）")
+    print(f"verifier 模型  : {verifier_model.version}（家族 {verifier_model.family}）")
+    if pair.waiver:
+        print(f"独立性豁免     : ⚠️ 已降级并入链 —— {pair.waiver.reason}")
+    else:
+        print("独立性         : worker 与 verifier 分属不同家族 ✅")
+    print(f"run_id         : {result.run_id}")
+    print(f"最终状态       : {result.state.value}")
+    print(f"裁决           : {result.verdict or '无（阻断/升级人工）'}")
+    print(f"执行次数       : {result.attempts}（返工上限 {args.max_rework}）")
+    print(f"skill 状态     : {result.skill_status}")
+    print(f"变异门禁全开火 : {result.mutants_all_fired}")
+    print(f"head_sha       : {(result.head_sha or '')[:24] or '-'}")
+    print(f"耗时           : {elapsed:.1f}s")
+    print()
+    print("=== 模型实际写出的 diff ===")
+    for event in view.timeline:
+        if event.get("type") == "artifact.produced":
+            patch = str(event.get("payload", {}).get("patch", ""))
+            print(patch.rstrip() or "(空)")
+    print()
+    print("=== 真实用量 ===")
+    print(f"worker         : in={worker_usage.input_tokens} out={worker_usage.output_tokens} "
+          f"reasoning={worker_usage.reasoning_tokens}")
+    print(f"verifier       : in={verifier_usage.input_tokens} out={verifier_usage.output_tokens} "
+          f"reasoning={verifier_usage.reasoning_tokens}")
+    print(f"合计           : in={total_in} out={total_out} "
+          f"≈${guard.budget.cost(total_in, total_out):.6f}")
+    print(f"预算账本       : external_requests={ledger['usage']['external_requests']} "
+          f"cost=${ledger['usage']['cost_usd']:.6f} kill_switch={guard.kill_switch_engaged}")
+    print()
+    print(f"事件数         : {len(view.timeline)} | 哈希链 "
+          f"{'完好' if view.chain_ok else '损坏'} | 六锚点 "
+          f"{'齐全' if view.complete else '缺失'}")
+    print(f"生成物目录     : {result.workdir}")
+    print(f"回放命令       : python3 run.py replay --run-id {result.run_id}")
+    return 0 if (view.complete and view.chain_ok
+                 and result.state.value == "ACCEPTED") else 1
+
+
 def cmd_p6_live(args: argparse.Namespace) -> int:
     """P6：用**真实模型**跑完整 P0 链路，产出可回放的证据链与真实用量。
 
@@ -769,6 +888,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_p6.add_argument("--allow-same-family", action="store_true",
                       help="显式接受 worker/verifier 同属一个模型家族（豁免会写进证据链）")
     p_p6.set_defaults(func=cmd_p6_live)
+
+    p_p6g = sub.add_parser(
+        "p6-live-git", help="P6-git：真实模型在真实 git worktree 里改代码，独立 verifier 重放裁决")
+    p_p6g.add_argument("--backend", default=os.getenv("MW_MODEL_BACKEND", "deepseek"))
+    p_p6g.add_argument("--intent", default=(
+        "修复 shop 结算税率：total 10 20 应输出 TOTAL=31.80，"
+        "且 receipt.json 与 stdout 一致"))
+    p_p6g.add_argument("--workdir", default=str(PROJECT_ROOT / "data" / "p6-git-runs"))
+    p_p6g.add_argument("--max-rework", type=int, default=1)
+    p_p6g.add_argument("--max-actions", type=int, default=20)
+    p_p6g.add_argument("--max-seconds", type=float, default=600.0)
+    p_p6g.add_argument("--max-requests", type=int, default=20)
+    p_p6g.add_argument("--max-cost", type=float, default=1.0)
+    p_p6g.add_argument("--allow-same-family", action="store_true",
+                       help="显式接受 worker/verifier 同属一个模型家族（豁免会写进证据链）")
+    p_p6g.add_argument("--sampling-outcome", default="ACCEPT", choices=["ACCEPT", "REJECT"])
+    p_p6g.add_argument("--sampling-root-cause", default="")
+    p_p6g.set_defaults(func=cmd_p6_live_git)
     return parser
 
 

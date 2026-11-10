@@ -17,7 +17,7 @@ from pathlib import Path
 from ..context.sources import SourcePlane
 from ..delivery.sampler import Sampler
 from ..guardrails.rules import derive_rule  # noqa: F401  (规则回流路径复用)
-from ..models import ModelAdapter
+from ..models import IndependenceWaiver, ModelAdapter
 from ..platform.envelope import SEMCONV_VERSION, make_envelope, new_id, utcnow
 from ..platform.store import EventStore
 from ..workspace.seed import CLI_SOURCE, PRICING_CORRECT, GitWorkspace
@@ -30,7 +30,7 @@ from ..verification.skill_spec import SkillProof
 from ..chief.policy import (
     EvidenceSpec, Kickoff, Predicate, TaskIntent, TaskState, assert_transition,
 )
-from ..workers.git_worker import GitCodeWorker
+from ..workers.git_worker import GitCodeWorker, WorkerOutputError
 
 GOVERNANCE_DOCS = (
     "六段式 verify skill：Launch / Doctor / Drive / Evidence / Cleanup / Helpers",
@@ -75,15 +75,20 @@ class P2Pipeline:
         workdir: Path,
         *,
         max_rework: int = 2,
+        waiver: IndependenceWaiver | None = None,
     ):
-        if worker_model.family == verifier_model.family:
-            raise RuntimeError("worker 与 verifier 必须分属不同模型家族")
+        if worker_model.family == verifier_model.family and waiver is None:
+            raise RuntimeError(
+                "worker 与 verifier 必须分属不同模型家族"
+                "（确需同家族请显式声明豁免，豁免会被写进证据链）"
+            )
         self.store = store
         self.source_plane = source_plane
         self.worker_model = worker_model
         self.verifier_model = verifier_model
         self.workdir = Path(workdir)
         self.max_rework = max_rework
+        self.waiver = waiver
 
     def _emit(self, run_id: str, task_id: str, event_type: str, payload: dict,
               **fields: object) -> int:
@@ -112,6 +117,18 @@ class P2Pipeline:
             Predicate("mutation_gate_active", "governance_contains", "变异"),
         ))
 
+    def _run_worker(self, worker: GitCodeWorker, kickoff: Kickoff, docs,
+                    run_id: str, task_id: str):
+        """跑一次 worker；产出不可机械检查时返回 None（记事件，不崩流水线）。"""
+        try:
+            return worker.run(kickoff, docs)
+        except WorkerOutputError as exc:
+            self._emit(run_id, task_id, "worker.output_rejected", {
+                "attempt": kickoff.attempt, "reason": str(exc),
+                "note": "交付物必须可机械检查；本次 attempt 作废，换新 worker 重来",
+            })
+            return None
+
     def handle(self, intent: TaskIntent, scenario: P2Scenario) -> P2Result:
         run_id, task_id = new_id("run"), new_id("task")
         root = (self.workdir / run_id).resolve()
@@ -137,6 +154,12 @@ class P2Pipeline:
             "baseline_sha": baseline_sha,
             "baseline_fingerprint": baseline_fingerprint, "phase": "P2",
         })
+        if self.waiver is not None:
+            # 独立性降级必须第一时间入链：谁在什么时候、用什么理由降级，一目了然。
+            self._emit(run_id, task_id, "model.independence_waived", {
+                **self.waiver.to_dict(),
+                "note": "本次行为裁决没有跨模型家族独立性；结构性 holdout（输入隔离）仍然成立",
+            })
 
         docs = [
             self.source_plane.ingest(
@@ -259,7 +282,25 @@ class P2Pipeline:
             self._transition(run_id, task_id, TaskState.DISPATCHED, TaskState.IN_PROGRESS,
                              "worker 开始修改真实文件")
 
-            output = worker.run(kickoff, docs)
+            output = self._run_worker(worker, kickoff, docs, run_id, task_id)
+            if output is None:
+                # 产出不可机械检查 → 本次 attempt 作废，换全新 worker 重来。
+                if attempt <= self.max_rework:
+                    self._emit(run_id, task_id, "rework.requested", {
+                        "attempt": attempt, "next": "新 worker + 新 worktree + 全新上下文",
+                        "max_rework": self.max_rework,
+                        "reason": "worker 产出不可机械检查",
+                    })
+                    continue
+                self._emit(run_id, task_id, "human.escalated", {
+                    "reason": f"连续 {attempt} 次 worker 产出不可机械检查，返工上限 {self.max_rework}",
+                })
+                self._transition(run_id, task_id, TaskState.IN_PROGRESS,
+                                 TaskState.NEEDS_HUMAN, "返工耗尽")
+                return P2Result(
+                    run_id, task_id, TaskState.NEEDS_HUMAN, None, attempts,
+                    skill.skill_hash, proof.status, mutations.all_fired, None, "", root,
+                )
             self.store.put_agent_run({
                 "run_id": worker_run_id, "task_id": task_id, "actor": "git-code-worker",
                 "role": "author", "model_family": output.model_response.model_family,
@@ -274,6 +315,9 @@ class P2Pipeline:
                 "model_family": output.model_response.model_family,
                 "model_version": output.model_response.model_version,
                 "prompt_hash": output.model_response.prompt_hash,
+                "usage": output.model_response.usage.to_dict(),
+                "provider_request_id": output.model_response.provider_request_id,
+                "finish_reason": output.model_response.finish_reason,
                 "tool_calls": list(output.tool_calls),
                 "self_check_output": output.self_check_output,
             }, actor="git-code-worker", role="author", parent_id=worker_run_id,
@@ -310,6 +354,7 @@ class P2Pipeline:
                 author_family=output.model_response.model_family,
                 skill_proof=proof, mutation_report=mutations,
                 source_hashes=source_hashes, attempt=attempt,
+                independence_waiver=self.waiver,
             )
             verdict_result = verdict.result
             head_sha = verdict.head_sha
@@ -365,15 +410,14 @@ class P2Pipeline:
 
 
 def _with_rate(model: ModelAdapter, rate: str) -> ModelAdapter:
-    """给 ScriptedModel 换本轮脚本；真实模型后端则把目标值写进 prompt 约束。
+    """给 ScriptedModel 换本轮脚本；**真实模型不做任何注入**。
 
-    P2 的确定性演示只需替换脚本；真模型接入时这里应改为在 kickoff 里带
-    「可验证证据规格」而不是改模型对象。
+    这是有意为之：真实模型必须自己从「意图 + 一手原文」推导税率（6% → 0.06）。
+    把目标值塞进 prompt 会让「模型真的在改代码」变成「照抄答案」，那这条路径
+    就没有验证价值了。`scenario.worker_rates` 只服务于确定性测试脚本。
     """
     from ..models import ScriptedModel
     if isinstance(model, ScriptedModel):
         model.script = [f"将税率改为 TAX_RATE = {rate}，并说明依据的 source_hash。"]
         model.calls = 0
-        return model
-    model._p2_target_rate = rate  # type: ignore[attr-defined]
     return model

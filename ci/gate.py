@@ -703,7 +703,7 @@ class Gate:
         )
         response = model.complete("只回答一个词：OK")
         ok = bool(response.text.strip()) and response.usage.total_tokens > 0
-        return ok, {
+        evidence = {
             "summary": (f"{model.version} 调用成功：{response.usage.total_tokens} tokens "
                         f"(in={response.usage.input_tokens} out={response.usage.output_tokens} "
                         f"reasoning={response.usage.reasoning_tokens}) "
@@ -713,6 +713,43 @@ class Gate:
             "provider_request_id": response.provider_request_id,
             "text_preview": response.text[:80],
         }
+
+        # 第二问：真实模型能不能产出 P2 worker 需要的**可机械检查**格式？
+        # 这是真实模型路径最容易出问题的地方（模型可能回 6%、回整段文件、
+        # 回没有赋值行的话），连通性通过不代表这一层通过。
+        from michelin.workers.git_worker import _RATE_RE, _has_percent_suffix
+
+        probe = OpenAICompatModel(
+            os.getenv("MW_WORKER_MODEL", "deepseek-flash"), api_base=base, max_tokens=128
+        )
+        p2 = probe.complete(
+            "只回答一行赋值，格式为 `TAX_RATE = <数值>`。\n"
+            "数值是小数比例（6% 写成 0.06），不要带百分号、不要带其它内容。\n"
+            "现在把税率改成 6%。"
+        )
+        match = _RATE_RE.search(p2.text)
+        rate = match.group(1) if match else ""
+        percent = bool(match) and _has_percent_suffix(p2.text, match)
+        in_range = bool(match) and float(rate) <= 1
+        p2_ok = bool(match) and not percent and in_range
+        evidence["p2_format_probe"] = {
+            "model": probe.version,
+            "text_preview": p2.text[:120].replace("\n", "\\n"),
+            "parsed_rate": rate,
+            "percent_suffix": percent,
+            "in_range": in_range,
+            "ok": p2_ok,
+            "usage": p2.usage.to_dict(),
+        }
+        if not p2_ok:
+            evidence["reason"] = (
+                f"真实模型未能产出可机械检查的 TAX_RATE 赋值（parsed={rate!r} "
+                f"percent={percent} in_range={in_range}）"
+            )
+            evidence["summary"] += f"；⚠️ P2 输出格式探针失败（parsed={rate!r}）"
+            return False, evidence
+        evidence["summary"] += f"；P2 输出格式探针通过（TAX_RATE = {rate}）"
+        return ok, evidence
 
     def check_no_secret_in_repo(self):
         """P6：仓库里不能出现任何密钥字面量（真实模型接入后的必检项）。"""

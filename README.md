@@ -102,6 +102,16 @@ python3 run.py p6-live --backend deepseek --allow-same-family
 输出真实 token 用量、耗时与成本，并把这些数字记进证据链。门禁里的
 `real_model_smoke` 会在有密钥时做一次真实冒烟，**没有密钥就跳过**（CI 不依赖密钥）。
 
+**真实模型改代码**（P2 路径）：
+
+```bash
+python3 run.py p6-live-git --backend deepseek --allow-same-family
+```
+
+模型在**真实 git worktree** 里改文件、产出 unified diff；独立 verifier 在**另一个
+干净 worktree** 上 `git apply` 作者的 diff，再驱动真实 CLI 判定。模型不知道答案 ——
+它得自己从「意图 + 一手原文」把 6% 推成 `TAX_RATE = 0.06`。
+
 **关于模型家族独立性**：`deepseek-flash` 与 `deepseek-v4-pro` 同属
 `open-source-cn` 家族，默认会被 holdout 护栏拒绝。放行要显式声明
 （`--allow-same-family` 或 `MW_ALLOW_SAME_MODEL_FAMILY=1`），而且这份豁免
@@ -216,7 +226,9 @@ base_line clean=True  →  逐条注入变异  →  4/4 条规则命中
 - OTel 只落地了哈希链 span 与 GenAI 属性，尚未接具体可观测平台。
 - 夜间 cron、fan-out、durable queue 并发限流未接。
 - MCP 网关尚未接入；模型侧目前只做了 DeepSeek 与通用 OpenAI 兼容端点。
-- 真实模型目前只接在 P0 只读链路（P6）；P2/P3 的 git 任务仍是脚本化模型。
+- 真实模型接在 P0（只读分析）与 P2（改代码）两条链路；P3 的仓库访谈与自动起草
+  仍是确定性实现。
+- P2 的可写范围目前只有一个文件；多文件、多轮编辑、模型自己决定改哪些文件尚未做。
 
 ## 11. 许可
 

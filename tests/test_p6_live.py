@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -201,6 +202,97 @@ class TestWaiverIsRecorded(unittest.TestCase):
                     store, SourcePlane(store),
                     ScriptedModel("open-source-cn", "a", ["x"]),
                     ScriptedModel("open-source-cn", "b", ["PASS"]),
+                )
+        finally:
+            store.close()
+
+
+class TestP2RealModelPath(unittest.TestCase):
+    r"""P2 真实模型路径：worker 的产出必须可机械检查。
+
+    这里的两个用例是**真实模型跑出来的**：第一次接 DeepSeek 时，模型给出的
+    赋值被正则替换成了 `TAX_RATE = 0.06def total_price(items):` —— 数值后面的
+    `\s*` 贪婪吃掉了换行，产出是语法错误的文件。脚本模型路径没暴露它，
+    因为脚本输出后面紧跟的是句号而不是换行。
+    """
+
+    def setUp(self) -> None:
+        from michelin.workspace.seed import GitWorkspace
+
+        root = Path(tempfile.mkdtemp(prefix="mw-p6-git-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        self.workspace = GitWorkspace(root / "repo")
+        self.workspace.seed_baseline()
+        self.original = self.workspace.worktree("probe").read_file("shop/pricing.py")
+
+    def test_rate_substitution_preserves_line_structure(self) -> None:
+        from michelin.workers.git_worker import _RATE_RE
+
+        patched = _RATE_RE.sub("TAX_RATE = 0.06", self.original, count=1)
+        self.assertEqual(patched.count("\n"), self.original.count("\n"),
+                         "替换不得改变文件行数（\\s* 会吃掉换行）")
+        compile(patched, "pricing.py", "exec")  # 语法必须有效
+        self.assertIn("TAX_RATE = 0.06\n", patched)
+        self.assertIn("def total_price(items):", patched)
+
+    def test_percent_and_out_of_range_are_rejected(self) -> None:
+        from michelin.workers.git_worker import _RATE_RE, _has_percent_suffix
+
+        match = _RATE_RE.search("TAX_RATE = 6% 是税率")
+        self.assertIsNotNone(match)
+        self.assertTrue(_has_percent_suffix("TAX_RATE = 6% 是税率", match))
+        ok = _RATE_RE.search("TAX_RATE = 0.06 小数比例")
+        self.assertFalse(_has_percent_suffix("TAX_RATE = 0.06 小数比例", ok))
+
+    def test_worker_rejects_unparseable_output_as_reworkable_error(self) -> None:
+        """产出不可机械检查 → 抛 WorkerOutputError（可返工），不是崩流水线。"""
+        from michelin.workers.git_worker import WorkerOutputError
+
+        self.assertTrue(issubclass(WorkerOutputError, RuntimeError))
+
+
+class TestP2WaiverIsRecorded(unittest.TestCase):
+    """P2 的行为裁决同样必须把独立性降级写进证据链。"""
+
+    def test_pipeline_refuses_same_family_without_waiver(self) -> None:
+        from michelin.chief.p2_workflow import P2Pipeline
+        from michelin.context.sources import SourcePlane
+        from michelin.platform.store import EventStore
+
+        store = EventStore(":memory:")
+        try:
+            with self.assertRaises(RuntimeError):
+                P2Pipeline(
+                    store, SourcePlane(store),
+                    ScriptedModel("open-source-cn", "deepseek-flash", ["x"]),
+                    ScriptedModel("open-source-cn", "deepseek-v4-pro", ["PASS"]),
+                    Path(tempfile.mkdtemp(prefix="mw-p6-p2-")),
+                )
+        finally:
+            store.close()
+
+    def test_behavior_verifier_refuses_same_family_without_waiver(self) -> None:
+        from michelin.verification.behavior import BehaviorVerifier
+
+        store = EventStore(":memory:")
+        try:
+            verifier = BehaviorVerifier(
+                store, ScriptedModel("open-source-cn", "deepseek-v4-pro", ["PASS"]),
+                skill=None, workspace=None, run_root=Path("."),
+            )
+            from michelin.chief.policy import EvidenceSpec, Predicate
+            from michelin.verification.holdout import build_holdout
+
+            spec = EvidenceSpec((Predicate("m", "diff_contains", "diff --git"),))
+            bundle = build_holdout(
+                issue_body="i", artifact_text="diff --git",
+                self_reported_test_output="t", governance_docs=("只读",),
+            )
+            with self.assertRaises(HoldoutViolation):
+                verifier.verify(
+                    bundle, run_id="r", task_id="t", author_run_id="a",
+                    author_family="open-source-cn", skill_proof=None,
+                    mutation_report=None,
                 )
         finally:
             store.close()

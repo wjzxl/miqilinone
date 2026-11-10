@@ -13,7 +13,7 @@ P0 是确定性字符串谓词，P2 是 `git apply` + 六段式真实 CLI 驱动
 
 from __future__ import annotations
 
-from ..models import ModelAdapter
+from ..models import IndependenceWaiver, ModelAdapter
 from ..platform.envelope import (
     SEMCONV_VERSION, content_hash, make_envelope, new_id, utcnow,
 )
@@ -54,9 +54,10 @@ class BehaviorVerifier:
         mutation_report: MutationReport,
         source_hashes: tuple[str, ...] = (),
         attempt: int = 1,
+        independence_waiver: IndependenceWaiver | None = None,
     ) -> Verdict:
         assert_holdout_shape(bundle)
-        if self.model.family == author_family:
+        if self.model.family == author_family and independence_waiver is None:
             raise HoldoutViolation(
                 f"verifier 与作者同属 {author_family} 模型家族，裁决无效"
             )
@@ -122,6 +123,16 @@ class BehaviorVerifier:
         judge = self.model.complete(judge_prompt)
         checks.append({"name": "llm_judge_opinion", "kind": "advisory", "passed": True,
                        "detail": f"{self.model.version}: {judge.text[:120]}"})
+        checks.append({"name": "llm_judge_usage", "kind": "meta", "passed": True,
+                       "detail": f"judge 用量 {judge.usage.to_dict()}"})
+        if independence_waiver is not None:
+            # 降级必须出现在裁决记录里，不能只存在于某个人的命令行历史。
+            checks.append({
+                "name": "model_independence_waived", "kind": "meta", "passed": True,
+                "detail": (f"家族级独立性已豁免：verifier({independence_waiver.verifier_model}) "
+                           f"与 author({independence_waiver.worker_model}) 同属 "
+                           f"{independence_waiver.verifier_family}；{independence_waiver.reason}"),
+            })
 
         result = "PASS" if all(c["passed"] for c in checks if c["kind"] != "advisory") else "FAIL"
         verifier_run_id = new_id("run")
@@ -154,6 +165,11 @@ class BehaviorVerifier:
                 "independent_test_output": independent_output,
                 "self_reported_test_output": bundle.test_output,
                 "author_family": author_family, "verifier_family": self.model.family,
+                "independence_waiver": (
+                    independence_waiver.to_dict() if independence_waiver else None
+                ),
+                "judge_usage": judge.usage.to_dict(),
+                "provider_request_id": judge.provider_request_id,
                 "skill_hash": self.skill.skill_hash,
                 "skill_proof": skill_proof.to_dict(),
                 "mutations": mutation_report.to_dict(),

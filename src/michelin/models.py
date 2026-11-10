@@ -276,7 +276,11 @@ class OpenAICompatModel:
                 if attempt < self.attempts - 1:
                     time.sleep(1.5 * (attempt + 1))
                     continue
-                raise RuntimeError(f"模型调用失败（网络）: {type(exc).__name__}") from None
+                # 保留底层原因：只报 "URLError" 等于让人瞎猜。
+                reason = getattr(exc, "reason", None) or str(exc)
+                raise RuntimeError(
+                    f"模型调用失败（网络）: {type(exc).__name__}: {reason}"
+                ) from None
         else:  # pragma: no cover - 循环内要么 break 要么 raise
             raise RuntimeError(f"模型调用失败: {last_error}") from None
 

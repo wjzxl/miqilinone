@@ -4,3 +4,5 @@
 横切：append-only events（哈希链）、统一事件信封、身份与版本戳
 """
 __version__ = "0.1.0-p0"
+
+# CI PR probe: incremental diff must scan only this file.

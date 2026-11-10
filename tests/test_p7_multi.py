@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 import unittest
@@ -59,6 +60,58 @@ class TestScopeEnforcement(unittest.TestCase):
         for bad in ("../etc/passwd", "/etc/passwd", "shop/../../x.py"):
             with self.assertRaises(WorkerOutputError):
                 _safe_relpath(bad)
+
+
+class TestStaleBytecodeTrap(unittest.TestCase):
+    """锁死「陈旧字节码」陷阱：同长度改动必须真的生效。
+
+    这是真实 CI（ubuntu）上 P7 变红的根因：`.pyc` 头部记的是源文件的
+    **秒级** mtime + size，所以「同长度改动 + 同一秒内重写」会被 Python
+    判成缓存仍然有效 —— **故意改坏的版本根本没被加载**，变异体静默失效，
+    门禁于是误判「没开火」。
+
+    注意 `-S` 只跳过 site，**照样写 .pyc**；真正管用的是
+    PYTHONDONTWRITEBYTECODE=1。
+    """
+
+    def test_same_length_mutation_must_take_effect(self) -> None:
+        import subprocess
+        import sys
+        import tempfile as tf
+
+        from michelin.verification.generator import generate_skill
+
+        tmp = Path(tf.mkdtemp(prefix="mw-stale-pyc-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        skill = generate_skill(tmp / "skills", spec=build_multi_file_spec())
+        helper = (skill.root / "helpers" / "verify_helper.py").read_text(encoding="utf-8")
+        self.assertIn("PYTHONDONTWRITEBYTECODE", helper,
+                      "生成的 helper 必须禁止写 .pyc，否则同长度变异会静默失效")
+
+        workspace = GitWorkspace(tmp / "repo")
+        workspace.seed_baseline()
+        tree = workspace.worktree("stale")
+        tree.write_file("shop/pricing.py", PRICING_CORRECT)
+        tree.write_file("shop/cli.py", CLI_SOURCE_MULTI)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(tree.path)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        argv = [sys.executable, "-S", "-m", "shop.cli", "total", "10", "20"]
+
+        first = subprocess.run(argv, cwd=str(tree.path), env=env,
+                               capture_output=True, text=True, timeout=60)
+        self.assertEqual(first.stdout.strip(), "TOTAL=31.80")
+
+        # 同长度改写：0.06 -> 0.10（长度完全相同）
+        target = tree.path / "shop/pricing.py"
+        target.write_text(
+            target.read_text(encoding="utf-8").replace("TAX_RATE = 0.06", "TAX_RATE = 0.10"),
+            encoding="utf-8",
+        )
+        second = subprocess.run(argv, cwd=str(tree.path), env=env,
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(second.stdout.strip(), "TOTAL=33.00",
+                         "同长度改动必须真的生效，否则变异门禁形同虚设")
 
 
 class TestMultiFileWorker(unittest.TestCase):

@@ -10,6 +10,7 @@ P0 的 mutation_test 只是字符串替换，验证的是谓词本身；P2 换�
 
 from __future__ import annotations
 
+import shutil
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -96,6 +97,20 @@ def _apply(tree, relpath: str, old: str, new: str) -> None:
     tree.write_file(relpath, current.replace(old, new, 1))
 
 
+def _clear_bytecode(tree) -> None:
+    """删掉树里的 __pycache__。
+
+    这是「陈旧字节码」陷阱的第二道防线：第一道是 helper 里的
+    PYTHONDONTWRITEBYTECODE=1（根本不写 .pyc）。这里再把**已经存在的**
+    .pyc 清掉 —— 万一之前有别的运行写过，同长度改动 + 秒级 mtime 会让
+    Python 复用陈旧字节码，导致「故意改坏的版本根本没被加载」，
+    变异门禁就会静默失效（这正是真实 CI 上抓到的那次）。
+    """
+    for cache in tree.path.rglob("__pycache__"):
+        if cache.is_dir():
+            shutil.rmtree(cache, ignore_errors=True)
+
+
 def _probe(tree, skill: GeneratedSkill, run_root: Path,
            label: str, mutations: tuple[tuple[str, str, str, str], ...] = (),
            baseline_files: dict[str, str] | None = None) -> tuple[bool, str, bool]:
@@ -114,6 +129,7 @@ def _probe(tree, skill: GeneratedSkill, run_root: Path,
         tree.write_file(rel, content)
     for _name, relpath, old, new in mutations:
         _apply(tree, relpath, old, new)
+    _clear_bytecode(tree)
     run_dir = run_root / f"{label}-{uuid.uuid4().hex[:8]}"
     ok, phases, executed = drive_probe(skill, tree.path, run_dir)
     drive = next((p for p in phases if p.phase == "drive"), None)

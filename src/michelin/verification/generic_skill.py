@@ -149,6 +149,9 @@ def run_cmd(cmd, label):
     env = dict(os.environ)
     env["VERIFY_DATA_DIR"] = str(INSTANCE / "data")
     env["PYTHONPATH"] = str(APP_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    # 不写 .pyc：.pyc 记的是秒级 mtime + size，同长度改动会被当成「缓存仍有效」，
+    # 于是「故意改坏的版本」根本没被加载，变异门禁静默失效。
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     proc = subprocess.run(
         list(cmd["argv"]), cwd=str(APP_ROOT), env=env,
         capture_output=True, text=True,

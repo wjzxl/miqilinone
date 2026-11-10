@@ -64,6 +64,11 @@ def cli(*args: str) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["SHOP_DATA_DIR"] = str(instance_dir() / "data")
     env["PYTHONPATH"] = str(root())
+    # 必须禁止写 .pyc：.pyc 头部记的是源文件的**秒级** mtime + size，
+    # 同长度的改动在同一秒内重写时，Python 会认为缓存仍然有效并复用**陈旧字节码** ——
+    # 那样「故意改坏的版本」其实根本没被加载，变异门禁就会静默失效。
+    # （-S 只跳过 site，不禁止写字节码；真正管用的是这个环境变量。）
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     return subprocess.run(
         [sys.executable, "-S", "-m", APP_MODULE, *args],
         cwd=str(root()), env=env, capture_output=True, text=True, timeout=30,
